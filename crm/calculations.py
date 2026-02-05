@@ -142,6 +142,77 @@ def orientation_probability_vectorized(theta_array, phi_array, stretch, phi0):
 
 
 @jit(nopython=True, fastmath=True)
+def flow_integrand_kernel(x, q, radius, length, n_cyl, cos_psi, sin_psi, stretch, phi0):
+    """
+    JIT-compiled integrand kernel for flow calculations (monodisperse radius).
+
+    Integration variables (in [0,1]):
+        x[0:n_cyl]: theta angles
+        x[n_cyl:]: phi angles
+    """
+    angles = np.empty(2 * n_cyl)
+    angles[:n_cyl] = x[:n_cyl] * np.pi
+    angles[n_cyl:] = x[n_cyl:] * (2.0 * np.pi)
+
+    iq_core = calculate_intensity_core(
+        angles, q, radius, length, n_cyl, cos_psi, sin_psi
+    )
+
+    theta = angles[:n_cyl]
+    phi = angles[n_cyl:]
+    prob = orientation_probability_vectorized(theta, phi, stretch, phi0)
+
+    prob_product = 1.0
+    for i in range(n_cyl):
+        prob_product *= prob[i]
+
+    angle_jacobian = (np.pi ** n_cyl) * ((2.0 * np.pi) ** n_cyl)
+    return iq_core * prob_product * angle_jacobian
+
+
+@jit(nopython=True, fastmath=True)
+def flow_integrand_kernel_polydisperse(
+    x, q, r_avg, sigma_r, length, n_cyl, cos_psi, sin_psi, stretch, phi0
+):
+    """
+    JIT-compiled integrand kernel for flow calculations with radius polydispersity.
+
+    Integration variables (in [0,1]):
+        x[0]: radius (scaled)
+        x[1:n_cyl+1]: theta angles
+        x[n_cyl+1:]: phi angles
+    """
+    r_min = max(0.0, r_avg - 4.0 * sigma_r)
+    r_max = r_avg + 4.0 * sigma_r
+    radius = r_min + x[0] * (r_max - r_min)
+
+    angles = np.empty(2 * n_cyl)
+    angles[:n_cyl] = x[1:1 + n_cyl] * np.pi
+    angles[n_cyl:] = x[1 + n_cyl:] * (2.0 * np.pi)
+
+    iq_core = calculate_intensity_core(
+        angles, q, radius, length, n_cyl, cos_psi, sin_psi
+    )
+
+    theta = angles[:n_cyl]
+    phi = angles[n_cyl:]
+    prob = orientation_probability_vectorized(theta, phi, stretch, phi0)
+
+    prob_product = 1.0
+    for i in range(n_cyl):
+        prob_product *= prob[i]
+
+    diff = radius - r_avg
+    radius_prob = radius * radius * np.exp(-diff * diff / (2.0 * sigma_r * sigma_r))
+
+    radius_jacobian = r_max - r_min
+    angle_jacobian = (np.pi ** n_cyl) * ((2.0 * np.pi) ** n_cyl)
+    jacobian = radius_jacobian * angle_jacobian
+
+    return iq_core * prob_product * radius_prob * jacobian
+
+
+@jit(nopython=True, fastmath=True)
 def scattering_kernel_vectorized(angles, radius, length, n_cyl, q_array):
     """
     Calculate scattering intensity for all Q-values simultaneously.
@@ -361,3 +432,22 @@ def apply_resolution_smearing(q_ideal, intensity_ideal, q_data, sigma_q):
         intensity_smeared[i] = np.trapz(intensity_at_q * kernel, q_range)
     
     return intensity_smeared
+
+
+def compute_cates_weights(lc, n_cyl_max):
+    """
+    Compute Cates exponential weights for chain-length polydispersity.
+
+    Args:
+        lc: Average cylinder number (Cates LC parameter)
+        n_cyl_max: Maximum cylinder count to include
+
+    Returns:
+        (n_values, weights, n_weighted_sum)
+    """
+    if lc <= 0 or n_cyl_max <= 0:
+        return None, None, None
+    n_values = np.arange(1, n_cyl_max + 1, dtype=np.float64)
+    weights = np.exp(-n_values / float(lc))
+    n_weighted_sum = np.sum(n_values * weights)
+    return n_values, weights, n_weighted_sum

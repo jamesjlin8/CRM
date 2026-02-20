@@ -16,6 +16,8 @@ import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
+from matplotlib.gridspec import GridSpec
 import numpy as np
 import pickle
 
@@ -134,6 +136,58 @@ def project_pattern(
     aligned = resample_pattern(q_sorted, p_sorted, n_features, q_train)
     centered = aligned - mean
     return (centered @ U[:, :n_components]).reshape(1, -1)
+
+
+def reconstruct_pattern(
+    alpha: np.ndarray, U: np.ndarray, mean: np.ndarray, n_components: int
+) -> np.ndarray:
+    """Reconstruct a 1D pattern from PCA coefficients: mean + alpha @ U^T."""
+    return mean + (alpha.reshape(1, -1) @ U[:, :n_components].T).reshape(-1)
+
+
+def grid_pattern_2d(
+    qx: np.ndarray, qy: np.ndarray, values: np.ndarray,
+    max_grid_size: int = 512,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Grid scattered (qx, qy, values) data onto a 2D array for imshow.
+
+    For data already on a regular grid (e.g. experimental raster scans),
+    uses fast direct indexing.  For scattered data (e.g. simulation output
+    sorted by |q|), bins onto a regular grid of at most *max_grid_size*
+    pixels per side.
+
+    Returns (grid, qx_axis, qy_axis).
+    """
+    unique_qx = np.unique(qx)
+    unique_qy = np.unique(qy)
+
+    # Heuristic: if the outer-product grid is compact, data is on a regular grid
+    if len(unique_qx) * len(unique_qy) <= 4 * len(qx):
+        unique_qx.sort()
+        unique_qy.sort()
+        grid = np.full((len(unique_qy), len(unique_qx)), np.nan)
+        x_idx = np.searchsorted(unique_qx, qx)
+        y_idx = np.searchsorted(unique_qy, qy)
+        grid[y_idx, x_idx] = values
+        return grid, unique_qx, unique_qy
+
+    # Scattered data — bin onto a regular grid
+    n_bins = min(max_grid_size, max(int(np.sqrt(len(qx))), 64))
+    qx_edges = np.linspace(qx.min(), qx.max(), n_bins + 1)
+    qy_edges = np.linspace(qy.min(), qy.max(), n_bins + 1)
+
+    sum_grid, _, _ = np.histogram2d(qx, qy, bins=[qx_edges, qy_edges], weights=values)
+    count_grid, _, _ = np.histogram2d(qx, qy, bins=[qx_edges, qy_edges])
+
+    with np.errstate(invalid="ignore"):
+        grid = np.where(count_grid > 0, sum_grid / count_grid, np.nan)
+
+    # histogram2d returns shape (n_qx, n_qy); transpose so rows = qy
+    grid = grid.T
+
+    qx_centers = 0.5 * (qx_edges[:-1] + qx_edges[1:])
+    qy_centers = 0.5 * (qy_edges[:-1] + qy_edges[1:])
+    return grid, qx_centers, qy_centers
 
 
 def format_prediction_filename(pattern_path: Path, predictions: dict) -> str:
@@ -268,36 +322,145 @@ def main() -> None:
                     parts.append(f"r2={r2_score:.3f}")
                 print(f"    ({', '.join(parts)})")
 
+    # ------------------------------------------------------------------
+    # Reconstruct the scattering pattern from PCA coefficients
+    # ------------------------------------------------------------------
+    reconstructed_1d = reconstruct_pattern(alpha, U, mean, n_components)
+
+    # Load raw 2D pattern for visualization
+    qx_raw, qy_raw, p_raw = load_pattern_raw(pattern_path)
+    q_mag_raw = np.sqrt(qx_raw**2 + qy_raw**2)
+
+    # Restrict to the q-range covered by the PCA training grid (no extrapolation)
+    if q_train is not None:
+        q_lo, q_hi = q_train.min(), q_train.max()
+    else:
+        q_lo, q_hi = q_mag_raw.min(), q_mag_raw.max()
+
+    in_range = (q_mag_raw >= q_lo) & (q_mag_raw <= q_hi)
+    qx_clip = qx_raw[in_range]
+    qy_clip = qy_raw[in_range]
+    p_clip = p_raw[in_range]
+    q_mag_clip = q_mag_raw[in_range]
+
+    # Grid original pattern at its actual data points (preserves beamstop, etc.)
+    original_grid, gqx, gqy = grid_pattern_2d(qx_clip, qy_clip, p_clip)
+
+    # Build a complete regular grid for the reconstruction so the PCA model
+    # fills the entire q-range (including beamstop / missing-data regions).
+    n_recon = max(len(gqx), len(gqy), 256)
+    recon_qx = np.linspace(gqx[0], gqx[-1], n_recon)
+    recon_qy = np.linspace(gqy[0], gqy[-1], n_recon)
+    rqx_2d, rqy_2d = np.meshgrid(recon_qx, recon_qy)
+    rq_mag = np.sqrt(rqx_2d**2 + rqy_2d**2)
+
+    # Evaluate the 1D PCA reconstruction at every grid pixel's |q|
+    if q_train is not None:
+        recon_flat = np.interp(rq_mag.ravel(), q_train, reconstructed_1d)
+    else:
+        q_sorted_input = np.sort(q_mag_raw)
+        if len(q_sorted_input) > len(reconstructed_1d):
+            q_sorted_input = q_sorted_input[:len(reconstructed_1d)]
+        recon_flat = np.interp(rq_mag.ravel(), q_sorted_input, reconstructed_1d)
+    recon_grid = recon_flat.reshape(rq_mag.shape)
+
+    # Mask pixels outside the training q-range
+    recon_grid = np.where(
+        (rq_mag >= q_lo) & (rq_mag <= q_hi), recon_grid, np.nan
+    )
+
+    # Replace non-positive values with NaN for log-scale display
+    original_grid = np.where(original_grid > 0, original_grid, np.nan)
+    recon_grid = np.where(recon_grid > 0, recon_grid, np.nan)
+
+    # Shared color limits across both 2D panels
+    valid_orig = original_grid[np.isfinite(original_grid)]
+    valid_recon = recon_grid[np.isfinite(recon_grid)]
+    all_valid = np.concatenate(
+        [v for v in (valid_orig, valid_recon) if v.size > 0]
+    )
+    if all_valid.size > 0:
+        shared_vmin = max(all_valid.min(), 1e-10)
+        shared_vmax = all_valid.max()
+    else:
+        shared_vmin, shared_vmax = 1e-6, 1.0
+
+    orig_extent = [gqx[0], gqx[-1], gqy[0], gqy[-1]]
+    recon_extent = [recon_qx[0], recon_qx[-1], recon_qy[0], recon_qy[-1]]
+
+    # ------------------------------------------------------------------
+    # Combined figure: 2D patterns (top) + PCA coefficients (bottom)
+    # ------------------------------------------------------------------
     plots_dir = Path(args.plots_dir)
     plots_dir.mkdir(parents=True, exist_ok=True)
+
+    fig = plt.figure(figsize=(14, 10))
+    gs = GridSpec(
+        2, 2,
+        height_ratios=[1.2, 1],
+        hspace=0.30,
+        wspace=0.35,
+    )
+
+    # --- Top-left: original pattern (clipped to PCA q-range) ---
+    ax_orig = fig.add_subplot(gs[0, 0])
+    im_orig = ax_orig.imshow(
+        original_grid,
+        extent=orig_extent,
+        origin="lower",
+        aspect="equal",
+        norm=LogNorm(vmin=shared_vmin, vmax=shared_vmax),
+        cmap="turbo",
+    )
+    ax_orig.set_xlabel(r"Q$_x$ (Å$^{-1}$)")
+    ax_orig.set_ylabel(r"Q$_y$ (Å$^{-1}$)")
+    ax_orig.set_title("Original Pattern")
+    fig.colorbar(im_orig, ax=ax_orig, label="Intensity", shrink=0.85)
+
+    # --- Top-right: PCA-reconstructed pattern (complete grid, no beamstop) ---
+    ax_recon = fig.add_subplot(gs[0, 1])
+    im_recon = ax_recon.imshow(
+        recon_grid,
+        extent=recon_extent,
+        origin="lower",
+        aspect="equal",
+        norm=LogNorm(vmin=shared_vmin, vmax=shared_vmax),
+        cmap="turbo",
+    )
+    ax_recon.set_xlabel(r"Q$_x$ (Å$^{-1}$)")
+    ax_recon.set_ylabel(r"Q$_y$ (Å$^{-1}$)")
+    ax_recon.set_title(f"PCA Reconstruction ({n_components} modes)")
+    fig.colorbar(im_recon, ax=ax_recon, label="Intensity", shrink=0.85)
+
+    # --- Bottom: PCA coefficients bar chart ---
+    ax_coeff = fig.add_subplot(gs[1, :])
     coeffs = alpha.reshape(-1)[:20]
-    plt.figure(figsize=(8, 4))
     x = np.arange(1, len(coeffs) + 1)
-    plt.bar(x, coeffs, color="tab:blue")
-    plt.xlabel("PCA mode")
-    plt.ylabel("coefficient")
-    plt.title("PCA coefficients (modes 1-10)")
-    plt.xticks(x)
+    ax_coeff.bar(x, coeffs, color="tab:blue")
+    ax_coeff.set_xlabel("PCA mode")
+    ax_coeff.set_ylabel("Coefficient")
+    ax_coeff.set_title("PCA Coefficients")
+    ax_coeff.set_xticks(x)
+
     param_text = (
         f"radius={predictions.get('radius', float('nan')):.3g}\n"
         f"length={predictions.get('length', float('nan')):.3g}\n"
         f"n_cyl={predictions.get('n_cyl', float('nan')):.3g}\n"
         f"stretch={predictions.get('stretch', float('nan')):.3g}"
     )
-    plt.gca().text(
-        0.98,
-        0.98,
-        param_text,
-        transform=plt.gca().transAxes,
-        ha="right",
-        va="top",
-        fontsize=9,
-        bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "none"}
+    ax_coeff.text(
+        0.98, 0.98, param_text,
+        transform=ax_coeff.transAxes,
+        ha="right", va="top", fontsize=9,
+        bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "none"},
     )
-    plt.tight_layout()
+
+    fig.suptitle(pattern_path.stem, fontsize=12, fontweight="bold")
+
     coeff_plot_name = format_prediction_filename(pattern_path, predictions)
-    plt.savefig(plots_dir / coeff_plot_name, dpi=300, bbox_inches="tight")
-    plt.close()
+    fig.savefig(plots_dir / coeff_plot_name, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved combined plot to {plots_dir / coeff_plot_name}")
 
     if args.output_json:
         output_path = Path(args.output_json)

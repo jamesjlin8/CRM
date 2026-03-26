@@ -14,7 +14,7 @@ from calculations import (
 
 # --- File Paths ---
 DATA_FILE = Path('./input/data_800k.dat')
-OUTPUT_FILE = Path('./output/800k_ncyl22_fit3.dat')
+OUTPUT_FILE = Path('./output/800k_ncyl22_fit2.dat')
 
 # --- Parameter Definitions: (initial_guess, fit_this_parameter) ---
 PARAMETERS = OrderedDict([

@@ -2,11 +2,16 @@
 """
 Train XGBoost regression models to predict physical parameters from PCA scores.
 
-This script consumes PCA artifacts produced by run_pca_analysis.py and trains
-XGBoost regressor models to predict metadata parameters from PCA coefficients.
+This script loads the reduced-order model (alpha, file_names) from pca_results
+produced by run_pca_analysis.py, builds metadata from file names, and trains
+XGBoost regressors using fixed best hyperparameters per parameter (from 20modes
+RandomizedSearchCV results). It does not read raw .dat files.
+
+Default:
+    python run_xg_model.py --pca-dir pca_results --model-components 20 --n-splits 5 --models-dir 20modes
 
 Usage:
-    python run_pca_model.py --pca-results-dir pca_results --model-components 10
+    python run_xg_model.py [--pca-dir DIR] [--models-dir DIR] [--model-components N] [--n-splits K]
 """
 
 import argparse
@@ -52,83 +57,66 @@ def parse_metadata_from_filename(filename: str) -> dict:
     }
 
 
-def load_scattering_patterns(
-    data_dir: Path, max_files: Optional[int] = None
-) -> Tuple[np.ndarray, list, np.ndarray, pd.DataFrame]:
+def _parse_n_modes_from_rom_path(rom_path: Path) -> Optional[int]:
+    """Extract n_modes from reduced_order_model_{n}modes.pkl."""
+    match = re.search(r"reduced_order_model_(\d+)modes\.pkl", rom_path.name)
+    return int(match.group(1)) if match else None
+
+
+def load_reduced_order_model(
+    pca_results_dir: Path, n_components: int
+) -> Tuple[np.ndarray, pd.DataFrame]:
     """
-    Load scattering patterns from .dat files in the specified directory.
+    Load PCA coefficients and file names from the reduced-order model in pca_results.
+    Build metadata from file names. Uses alpha[:, :n_components] for the requested components.
 
     Returns:
-        intensity_matrix: Array of shape (n_patterns, n_q_points)
-        file_names: List of source file names
-        q_values: Q-values corresponding to the columns (sorted by q magnitude)
-        metadata: DataFrame with columns: stretch, n_cyl, radius, length
+        alpha: Array of shape (n_patterns, n_components)
+        metadata: DataFrame with columns stretch, n_cyl, radius, length (from filenames)
     """
-    data_dir = Path(data_dir)
-    if not data_dir.exists():
-        raise FileNotFoundError(f"Directory not found: {data_dir}")
+    pca_results_dir = Path(pca_results_dir)
+    if not pca_results_dir.exists():
+        raise FileNotFoundError(f"Directory not found: {pca_results_dir}")
 
-    dat_files = sorted(data_dir.rglob("*.dat"))
-    dat_files = [f for f in dat_files if not f.name.endswith("_fit.dat")]
-    if max_files is not None:
-        dat_files = dat_files[:max_files]
-    if not dat_files:
-        raise ValueError(f"No .dat files found in {data_dir}")
+    rom_files = sorted(pca_results_dir.glob("reduced_order_model_*modes.pkl"))
+    if not rom_files:
+        raise FileNotFoundError(
+            f"No reduced_order_model_*modes.pkl found in {pca_results_dir}. "
+            "Run run_pca_analysis.py first."
+        )
 
-    print(f"Found {len(dat_files)} .dat files to process")
+    # Prefer ROM with n_modes >= n_components; use smallest such
+    candidates = []
+    for rom_path in rom_files:
+        n_modes = _parse_n_modes_from_rom_path(rom_path)
+        if n_modes is not None and n_modes >= n_components:
+            candidates.append((n_modes, rom_path))
+    if not candidates:
+        n_modes_first = _parse_n_modes_from_rom_path(rom_files[0])
+        if n_modes_first is not None and n_modes_first < n_components:
+            raise ValueError(
+                f"ROM has n_modes={n_modes_first}, but --model-components={n_components}. "
+                "Use model_components <= n_modes or re-run run_pca_analysis.py."
+            )
+        chosen_path = rom_files[0]
+    else:
+        candidates.sort(key=lambda x: x[0])
+        chosen_path = candidates[0][1]
 
-    patterns = []
-    file_names = []
-    metadata_list = []
-    q_values_ref = None
+    with open(chosen_path, "rb") as f:
+        rom = pickle.load(f)
+    alpha_full = rom["alpha"]
+    file_names = rom["file_names"]
+    n_modes_rom = rom.get("n_modes", alpha_full.shape[1])
+    alpha = alpha_full[:, : min(n_components, alpha_full.shape[1])]
 
-    for idx, dat_file in enumerate(dat_files):
-        try:
-            data = np.loadtxt(dat_file)
-            if data.size == 0:
-                print(f"Warning: Empty file: {dat_file}")
-                continue
-            if data.ndim == 1:
-                data = data.reshape(1, -1)
-            if data.shape[1] < 3:
-                print(
-                    f"Warning: Invalid format in {dat_file}: expected 3 columns, got {data.shape[1]}"
-                )
-                continue
-
-            qx = data[:, 0]
-            qy = data[:, 1]
-            p = data[:, 2]
-            q = np.sqrt(qx**2 + qy**2)
-            q_sorted_idx = np.argsort(q)
-            q_sorted = q[q_sorted_idx]
-            p_sorted = p[q_sorted_idx]
-
-            if idx == 0:
-                q_values_ref = q_sorted
-
-            patterns.append(p_sorted)
-            file_names.append(dat_file.name)
-            metadata_list.append(parse_metadata_from_filename(dat_file.name))
-        except Exception as exc:
-            print(f"Warning: Error loading {dat_file}: {exc}")
-            continue
-
-    if not patterns:
-        raise ValueError("No valid patterns loaded")
-
-    min_length = min(len(p) for p in patterns)
-    patterns = [p[:min_length] for p in patterns]
-    if q_values_ref is not None:
-        q_values_ref = q_values_ref[:min_length]
-
-    intensity_matrix = np.array(patterns)
+    metadata_list = [parse_metadata_from_filename(name) for name in file_names]
     metadata_df = pd.DataFrame(metadata_list)
-
     print(
-        f"Loaded {intensity_matrix.shape[0]} patterns with {intensity_matrix.shape[1]} q-points each"
+        f"Loaded ROM from {chosen_path.name}: {alpha.shape[0]} patterns, "
+        f"using {alpha.shape[1]} components (ROM has {n_modes_rom} modes)"
     )
-    return intensity_matrix, file_names, q_values_ref, metadata_df
+    return alpha, metadata_df
 
 
 def load_pca_components(pca_results_dir: Path) -> tuple[np.ndarray, np.ndarray, dict]:
@@ -140,33 +128,59 @@ def load_pca_components(pca_results_dir: Path) -> tuple[np.ndarray, np.ndarray, 
     return U, S, pca_model
 
 
-def align_intensity_to_pca(intensity_matrix: np.ndarray, mean: np.ndarray) -> np.ndarray:
-    n_features = mean.shape[0]
-    if intensity_matrix.shape[1] > n_features:
-        return intensity_matrix[:, :n_features]
-    if intensity_matrix.shape[1] < n_features:
-        raise ValueError(
-            f"Intensity matrix has {intensity_matrix.shape[1]} features, but PCA expects {n_features}."
-        )
-    return intensity_matrix
-
-
 XGB_BASE_PARAMS = {
     "objective": "reg:squarederror",
     "random_state": 42,
     "tree_method": "hist",
 }
 
-XGB_BEST_PARAMS = {
-    "n_estimators": 300,
-    "learning_rate": 0.1,
-    "max_depth": 5,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "min_child_weight": 2,
-    "gamma": 0.0,
-    "reg_alpha": 0.0,
-    "reg_lambda": 1.0,
+# Best hyperparameters per parameter from 20modes RandomizedSearchCV (cv_summary.json).
+# Each parameter gets its own model with these fixed params; run_predict.py reads parameter_models.pkl.
+XGB_BEST_PARAMS_BY_PARAM = {
+    "stretch": {
+        "n_estimators": 300,
+        "max_depth": 5,
+        "learning_rate": 0.05,
+        "subsample": 0.6,
+        "colsample_bytree": 0.6,
+        "min_child_weight": 2,
+        "gamma": 0.0,
+        "reg_alpha": 0.0,
+        "reg_lambda": 1.0,
+    },
+    "n_cyl": {
+        "n_estimators": 300,
+        "max_depth": 4,
+        "learning_rate": 0.1,
+        "subsample": 1.0,
+        "colsample_bytree": 0.8,
+        "min_child_weight": 4,
+        "gamma": 0.0,
+        "reg_alpha": 0.1,
+        "reg_lambda": 2.0,
+    },
+    "radius": {
+        "n_estimators": 200,
+        "max_depth": 8,
+        "learning_rate": 0.05,
+        "subsample": 0.6,
+        "colsample_bytree": 1.0,
+        "min_child_weight": 4,
+        "gamma": 0.1,
+        "reg_alpha": 0.1,
+        "reg_lambda": 2.0,
+    },
+    "length": {
+        "n_estimators": 200,
+        "max_depth": 8,
+        "learning_rate": 0.1,
+        "subsample": 0.6,
+        "colsample_bytree": 0.6,
+        "min_child_weight": 4,
+        "gamma": 0.2,
+        "reg_alpha": 0.0,
+        "reg_lambda": 1.0,
+    },
 }
 
 
@@ -183,11 +197,14 @@ def train_parameter_models(
     n_components = min(n_components, alpha.shape[1])
     param_cols = ["stretch", "n_cyl", "radius", "length"]
     models = {}
-    cv_summary = {"per_param": {}}
+    cv_summary = {}
     importance_results = {}
 
     for param in param_cols:
         if param not in metadata.columns:
+            continue
+        if param not in XGB_BEST_PARAMS_BY_PARAM:
+            print(f"Skipping {param}: no fixed hyperparameters defined")
             continue
 
         y = metadata[param].values
@@ -204,46 +221,51 @@ def train_parameter_models(
             print(f"Skipping {param}: not enough samples for CV")
             continue
 
+        best_params = {**XGB_BASE_PARAMS, **XGB_BEST_PARAMS_BY_PARAM[param]}
+        best_params_serializable = {
+            k: float(v) if isinstance(v, (np.floating, np.integer)) else v
+            for k, v in best_params.items()
+        }
+
+        # Train final model on full data (saved for run_predict.py)
+        best_model = XGBRegressor(**best_params)
+        best_model.fit(X, y_clean)
+
+        # Compute CV metrics for reporting
         kfold = KFold(n_splits=folds, shuffle=True, random_state=42)
         r2_scores = []
         rmse_scores = []
         for train_idx, test_idx in kfold.split(X):
             X_train, X_test = X[train_idx], X[test_idx]
             y_train, y_test = y_clean[train_idx], y_clean[test_idx]
-            model = XGBRegressor(**XGB_BASE_PARAMS, **XGB_BEST_PARAMS)
-            model.fit(X_train, y_train)
-            y_pred = model.predict(X_test)
+            fold_model = XGBRegressor(**best_params)
+            fold_model.fit(X_train, y_train)
+            y_pred = fold_model.predict(X_test)
             r2_scores.append(r2_score(y_test, y_pred))
             rmse_scores.append(np.sqrt(mean_squared_error(y_test, y_pred)))
 
-        cv_summary["per_param"][param] = {
+        cv_summary[param] = {
             "r2_mean": float(np.mean(r2_scores)),
             "r2_std": float(np.std(r2_scores, ddof=1)) if len(r2_scores) > 1 else 0.0,
             "rmse_mean": float(np.mean(rmse_scores)),
             "rmse_std": float(np.std(rmse_scores, ddof=1)) if len(rmse_scores) > 1 else 0.0,
             "n_splits": folds,
-            "params": dict(XGB_BASE_PARAMS, **XGB_BEST_PARAMS),
+            "params": best_params_serializable,
         }
-
-        best_model = XGBRegressor(**XGB_BASE_PARAMS, **XGB_BEST_PARAMS)
-        best_model.fit(X, y_clean)
-        y_pred = best_model.predict(X)
 
         models[param] = {
             "model_type": "XGBoost",
-            "r2_score": cv_summary["per_param"][param]["r2_mean"],
+            "r2_score": cv_summary[param]["r2_mean"],
             "model": best_model,
-            "params": dict(XGB_BASE_PARAMS, **XGB_BEST_PARAMS),
+            "params": best_params,
         }
 
         importance_results[param] = {
-            "r2_score": cv_summary["per_param"][param]["r2_mean"],
+            "r2_score": cv_summary[param]["r2_mean"],
             "importance": model_importance(best_model),
             "model_type": "XGBoost",
-            "params": dict(XGB_BASE_PARAMS, **XGB_BEST_PARAMS),
+            "params": best_params,
         }
-
-    cv_summary = cv_summary["per_param"]
 
     model_bundle = {
         "n_components": n_components,
@@ -309,54 +331,41 @@ def plot_predictive_importance(results: dict, output_path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train PCA-based parameter models using saved PCA components."
+        description="Train PCA-based parameter models using the reduced-order model from pca_results."
     )
     parser.add_argument(
-        "--input-dir",
-        type=str,
-        default="output",
-        help="Directory containing .dat files (default: output)",
-    )
-    parser.add_argument(
-        "--pca-results-dir",
+        "--pca-dir",
         type=str,
         default="pca_results",
-        help="Directory containing PCA artifacts (default: pca_results)",
+        dest="pca_dir",
+        help="Directory containing PCA artifacts and reduced-order model (default: pca_results)",
     )
     parser.add_argument(
         "--models-dir",
         type=str,
-        default="10modes",
-        help="Directory to save model outputs (default: 10modes)",
+        default="20modes",
+        help="Directory to save model outputs (default: 20modes)",
     )
     parser.add_argument(
         "--model-components",
         type=int,
-        default=10,
-        help="Number of PCA components to use for modeling (default: 10)",
+        default=20,
+        help="Number of PCA components to use for modeling (default: 20)",
     )
     parser.add_argument(
         "--n-splits",
         type=int,
         default=5,
-        help="Number of CV splits (default: 5)",
+        help="Number of CV splits for reporting (default: 5)",
     )
     args = parser.parse_args()
 
-    input_dir = Path(args.input_dir)
-    pca_results_dir = Path(args.pca_results_dir)
+    pca_results_dir = Path(args.pca_dir)
     models_dir = Path(args.models_dir) if args.models_dir else pca_results_dir / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
 
-    U, _S, pca_model = load_pca_components(pca_results_dir)
-    mean_intensity = pca_model["mean_"]
-
-    intensity_matrix, file_names, _q_values, metadata = load_scattering_patterns(input_dir)
-    intensity_matrix = align_intensity_to_pca(intensity_matrix, mean_intensity)
-
-    n_components = min(args.model_components, U.shape[1])
-    centered_data = intensity_matrix - mean_intensity
-    alpha = centered_data @ U[:, :n_components]
+    alpha, metadata = load_reduced_order_model(pca_results_dir, args.model_components)
+    n_components = alpha.shape[1]
 
     if metadata is None or metadata.empty:
         raise ValueError("No metadata available; cannot train parameter models.")
@@ -364,18 +373,19 @@ def main() -> None:
     metadata = metadata.reset_index(drop=True)
 
     model_bundle, importance_results = train_parameter_models(
-        alpha, metadata, n_components=n_components, n_splits=args.n_splits
+        alpha,
+        metadata,
+        n_components=n_components,
+        n_splits=args.n_splits,
     )
     print_cv_summary(model_bundle.get("cv_summary", {}))
 
     models_path = models_dir / "parameter_models.pkl"
     with open(models_path, "wb") as f:
         pickle.dump(model_bundle, f)
-    print(f"Saved parameter models to {models_path}")
 
     gb_importance_path = models_dir / "predictive_importance_xgboost.png"
     plot_predictive_importance(importance_results, gb_importance_path)
-    print(f"Saved predictive importance plots to {gb_importance_path}")
 
     importance_pickle = models_dir / "predictive_importance_results.pkl"
     with open(importance_pickle, "wb") as f:
@@ -385,7 +395,7 @@ def main() -> None:
     with open(summary_path, "w") as f:
         json.dump(model_bundle.get("cv_summary", {}), f, indent=2)
 
-
+    print(f"Saved data to {models_dir}/")
 
 if __name__ == "__main__":
     main()

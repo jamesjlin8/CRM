@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Plot FlowCalc-generated scattering pattern data files.
-Usage: python plotting.py <data_file> [--smear] [--both] [--save]
+Usage: python plotting.py <data_file> [--smear] [--both] [--save] [--ivq]
 
 Parameters are extracted from the filename (St, cyl, r, l) or set in CONFIG below.
 """
@@ -293,7 +293,7 @@ def plot_scattering_pattern(qx, qy, intensity, params, title="", use_log=True,
     marker_size = params['graphingparameter'] * 150000 / n_points
     
     scatter = ax.scatter(qy, qx, s=marker_size, c=plot_values, 
-                        cmap='jet', marker='s', edgecolors='none')
+                        cmap='turbo', marker='s', edgecolors='none')
     
     cbar = plt.colorbar(scatter, ax=ax)
     cbar.set_label('I(q)', fontsize=params['fontsize'])
@@ -329,7 +329,76 @@ def plot_scattering_pattern(qx, qy, intensity, params, title="", use_log=True,
     return fig
 
 
-def plot_from_data_file(data_file, smear=False, plot_both=False, save=False):
+def _radial_average(q, intensity, n_bins=200):
+    """Compute 1D radial average I(q) from 2D intensity."""
+    q = np.asarray(q, dtype=float)
+    intensity = np.asarray(intensity, dtype=float)
+
+    mask = np.isfinite(q) & np.isfinite(intensity)
+    if not np.any(mask):
+        return np.array([]), np.array([])
+
+    q = q[mask]
+    intensity = intensity[mask]
+
+    q_min, q_max = float(q.min()), float(q.max())
+    if q_min == q_max:
+        return np.array([q_min]), np.array([np.nanmean(intensity)])
+
+    bin_edges = np.linspace(q_min, q_max, n_bins + 1)
+    bin_indices = np.digitize(q, bin_edges) - 1
+    bin_indices = np.clip(bin_indices, 0, n_bins - 1)
+
+    sums = np.bincount(bin_indices, weights=intensity, minlength=n_bins)
+    counts = np.bincount(bin_indices, minlength=n_bins)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        I_q = np.where(counts > 0, sums / counts, np.nan)
+
+    q_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    return q_centers, I_q
+
+
+def plot_I_vs_q(q, inosq, iwithsq=None, params=None, title_suffix="", output_path=None):
+    """Plot 1D I(q) curve(s) from 2D intensity data on log-log axes."""
+    q = np.asarray(q, dtype=float)
+
+    q_1d_inosq, Iq_inosq = _radial_average(q, inosq)
+    if q_1d_inosq.size == 0:
+        print("Warning: Could not compute radial average for inosq.")
+        return None
+
+    if iwithsq is not None:
+        q_1d_iwithsq, Iq_iwithsq = _radial_average(q, iwithsq)
+    else:
+        q_1d_iwithsq, Iq_iwithsq = None, None
+
+    fig, ax = plt.subplots(figsize=(params.get('fig_width', 6), params.get('fig_height', 5)) if params else (6, 5))
+
+    ax.plot(q_1d_inosq, Iq_inosq, label="I(q) no S(q)")
+    if q_1d_iwithsq is not None:
+        ax.plot(q_1d_iwithsq, Iq_iwithsq, label="I(q) with S(q)")
+
+    ax.set_xlabel(r'$q$', fontsize=(params.get('fontsize', 12) if params else 12))
+    ax.set_ylabel(r'$I(q)$', fontsize=(params.get('fontsize', 12) if params else 12))
+    if title_suffix:
+        ax.set_title(f'I(q) {title_suffix}', fontsize=(params.get('fontsize', 12) + 2 if params else 14))
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.legend()
+    ax.tick_params(labelsize=(params.get('fontsize', 12) if params else 12))
+    plt.tight_layout()
+
+    if output_path is not None:
+        output_path = Path(output_path)
+        fig.savefig(output_path, dpi=(params.get('save_dpi', 300) if params else 300),
+                    format='pdf', bbox_inches='tight')
+        print(f"Saved: {output_path}")
+
+    return fig
+
+
+def plot_from_data_file(data_file, smear=False, plot_both=False, save=False, plot_ivq=False):
     """Read data file and create scattering pattern plot.
     
     Parameters are extracted from the filename and CONFIG.
@@ -345,6 +414,8 @@ def plot_from_data_file(data_file, smear=False, plot_both=False, save=False):
         Plot both inosq and iwithsq (default: False, inosq only)
     save : bool
         Save figures to PDF at 300 DPI (default: False)
+    plot_ivq : bool
+        Also plot 1D I(q) curve(s) (default: False)
     """
     data_file = Path(data_file)
     
@@ -388,8 +459,8 @@ def plot_from_data_file(data_file, smear=False, plot_both=False, save=False):
     
     # Load data
     data = np.loadtxt(data_file)
-    qx = data[:, 0]
-    qy = data[:, 1]
+    qx = data[:, 1]
+    qy = data[:, 0]
     p = data[:, 2]
     
     print(f"  Loaded {len(qx)} data points")
@@ -440,6 +511,19 @@ def plot_from_data_file(data_file, smear=False, plot_both=False, save=False):
             title=f"Scattering Pattern (With Structure Factor)\nStretch = {stretch_val}",
             output_path=iwithsq_path
         )
+
+    # Plot I vs q (1D) if requested
+    if plot_ivq:
+        ivq_suffix = f"(Stretch = {stretch_val})"
+        ivq_path = None
+        if save:
+            ivq_path = output_dir / f'Phi0_St{stretch_str}_{n_cyl_str}cyl_{radius_str}r_{length_str}l_Iq.pdf'
+        plot_I_vs_q(
+            q, inosq, iwithsq if plot_both else None,
+            params=params,
+            title_suffix=ivq_suffix,
+            output_path=ivq_path
+        )
     
     plt.show()
 
@@ -455,6 +539,8 @@ def main():
                         help="Plot both inosq and iwithsq (default: inosq only)")
     parser.add_argument("--save", action="store_true",
                         help="Save figures to PDF at 300 DPI")
+    parser.add_argument("--ivq", action="store_true",
+                        help="Also plot 1D I(q) curve(s)")
     
     if len(sys.argv) < 2:
         parser.print_help()
@@ -463,7 +549,13 @@ def main():
         sys.exit(1)
     
     args = parser.parse_args()
-    plot_from_data_file(args.data_file, smear=args.smear, plot_both=args.both, save=args.save)
+    plot_from_data_file(
+        args.data_file,
+        smear=args.smear,
+        plot_both=args.both,
+        save=args.save,
+        plot_ivq=args.ivq,
+    )
 
 
 if __name__ == "__main__":

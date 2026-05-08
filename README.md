@@ -1,1 +1,1 @@
-Connected-rod model in Python
+Connected-rod model + PCA + ML in Python

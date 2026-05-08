@@ -533,15 +533,16 @@ def plot_reconstructed_patterns(intensity_matrix: np.ndarray,
     
     x_axis = q_values if q_values is not None else np.arange(intensity_matrix.shape[1])
     x_label = r'$q$ [Å⁻¹]' if q_values is not None else 'Q-point Index'
-    use_log = True  # Use log scale for intensity
+    use_loglog = q_values is not None and np.all(np.asarray(q_values) > 0)
     
     for row, pattern_idx in enumerate(pattern_indices):
         original = intensity_matrix[pattern_idx, :]
         
         # Plot original
         ax = axes[row, 0]
-        if use_log:
-            ax.semilogy(x_axis, original, 'k-', linewidth=2, label='Original')
+        if use_loglog:
+            orig_mask = np.isfinite(x_axis) & np.isfinite(original) & (x_axis > 0) & (original > 0)
+            ax.loglog(x_axis[orig_mask], original[orig_mask], 'k-', linewidth=2, label='Original')
         else:
             ax.plot(x_axis, original, 'k-', linewidth=2, label='Original')
         ax.set_title('Original' if row == 0 else '', fontsize=10, fontweight='bold')
@@ -557,9 +558,11 @@ def plot_reconstructed_patterns(intensity_matrix: np.ndarray,
             reconstructed = (alpha @ U[:, :n_modes].T + mean_intensity).flatten()
             
             ax = axes[row, col]
-            if use_log:
-                ax.semilogy(x_axis, original, 'k--', linewidth=1, alpha=0.5, label='Original')
-                ax.semilogy(x_axis, reconstructed, 'r-', linewidth=1.5, label=f'{n_modes} modes')
+            if use_loglog:
+                orig_mask = np.isfinite(x_axis) & np.isfinite(original) & (x_axis > 0) & (original > 0)
+                recon_mask = np.isfinite(x_axis) & np.isfinite(reconstructed) & (x_axis > 0) & (reconstructed > 0)
+                ax.loglog(x_axis[orig_mask], original[orig_mask], 'k--', linewidth=1, alpha=0.5, label='Original')
+                ax.loglog(x_axis[recon_mask], reconstructed[recon_mask], 'r-', linewidth=1.5, label=f'{n_modes} modes')
             else:
                 ax.plot(x_axis, original, 'k--', linewidth=1, alpha=0.5, label='Original')
                 ax.plot(x_axis, reconstructed, 'r-', linewidth=1.5, label=f'{n_modes} modes')

@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """
 Train XGBoost regression models to predict physical parameters from PCA scores.
-
-This script loads the reduced-order model (alpha, file_names) from pca_results
-produced by run_pca_analysis.py, builds metadata from file names, and trains
-XGBoost regressors using fixed best hyperparameters per parameter (from 20modes
-RandomizedSearchCV results). It does not read raw .dat files.
+Use --random-search to run RandomizedSearchCV and refresh xgboost_best_params.json.
 
 Default:
     python run_xg_model.py --pca-dir pca_results --model-components 20 --n-splits 5 --models-dir 20modes
 
 Usage:
     python run_xg_model.py [--pca-dir DIR] [--models-dir DIR] [--model-components N] [--n-splits K]
+    python run_xg_model.py ... --random-search
 """
 
 import argparse
@@ -26,7 +23,8 @@ import matplotlib.pyplot as plt
 import pickle
 
 from sklearn.metrics import r2_score, mean_squared_error
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, RandomizedSearchCV
+from sklearn.utils import resample
 from xgboost import XGBRegressor
 
 
@@ -119,69 +117,86 @@ def load_reduced_order_model(
     return alpha, metadata_df
 
 
-def load_pca_components(pca_results_dir: Path) -> tuple[np.ndarray, np.ndarray, dict]:
-    pca_file = pca_results_dir / "pca_components.pkl"
-    if not pca_file.exists():
-        raise FileNotFoundError(f"PCA components not found: {pca_file}")
-    with open(pca_file, "rb") as f:
-        U, S, pca_model = pickle.load(f)
-    return U, S, pca_model
-
-
 XGB_BASE_PARAMS = {
     "objective": "reg:squarederror",
     "random_state": 42,
     "tree_method": "hist",
 }
 
-# Best hyperparameters per parameter from 20modes RandomizedSearchCV (cv_summary.json).
-# Each parameter gets its own model with these fixed params; run_predict.py reads parameter_models.pkl.
-XGB_BEST_PARAMS_BY_PARAM = {
-    "stretch": {
-        "n_estimators": 300,
-        "max_depth": 5,
-        "learning_rate": 0.05,
-        "subsample": 0.6,
-        "colsample_bytree": 0.6,
-        "min_child_weight": 2,
-        "gamma": 0.0,
-        "reg_alpha": 0.0,
-        "reg_lambda": 1.0,
-    },
-    "n_cyl": {
-        "n_estimators": 300,
-        "max_depth": 4,
-        "learning_rate": 0.1,
-        "subsample": 1.0,
-        "colsample_bytree": 0.8,
-        "min_child_weight": 4,
-        "gamma": 0.0,
-        "reg_alpha": 0.1,
-        "reg_lambda": 2.0,
-    },
-    "radius": {
-        "n_estimators": 200,
-        "max_depth": 8,
-        "learning_rate": 0.05,
-        "subsample": 0.6,
-        "colsample_bytree": 1.0,
-        "min_child_weight": 4,
-        "gamma": 0.1,
-        "reg_alpha": 0.1,
-        "reg_lambda": 2.0,
-    },
-    "length": {
-        "n_estimators": 200,
-        "max_depth": 8,
-        "learning_rate": 0.1,
-        "subsample": 0.6,
-        "colsample_bytree": 0.6,
-        "min_child_weight": 4,
-        "gamma": 0.2,
-        "reg_alpha": 0.0,
-        "reg_lambda": 1.0,
-    },
+# Search space for RandomizedSearchCV (shared across stretch / n_cyl / radius / length).
+XGB_PARAM_DISTRIBUTIONS = {
+    "n_estimators": list(range(100, 501, 25)),
+    "max_depth": list(range(3, 12)),
+    "learning_rate": np.round(np.logspace(-2.0, -0.45, 28), 6).tolist(),
+    "subsample": [0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+    "colsample_bytree": [0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+    "min_child_weight": [1, 2, 3, 4, 5, 6, 7, 8],
+    "gamma": [0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3],
+    "reg_alpha": [0.0, 0.05, 0.1, 0.15, 0.2, 0.5, 1.0],
+    "reg_lambda": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0],
 }
+
+
+def _params_to_serializable(params: dict) -> dict:
+    return {
+        k: float(v) if isinstance(v, (np.floating, np.integer)) else v
+        for k, v in params.items()
+    }
+
+
+def load_best_params_from_json(models_dir: Path) -> Optional[dict]:
+    best_params_path = models_dir / "xgboost_best_params.json"
+    if not best_params_path.exists():
+        return None
+
+    try:
+        with open(best_params_path, "r") as f:
+            loaded = json.load(f)
+    except Exception as exc:
+        print(
+            f"Error: failed to read {best_params_path} ({exc}). "
+            "Falling back to random search."
+        )
+        return None
+
+    if not isinstance(loaded, dict):
+        print(
+            f"Error: {best_params_path} does not contain a JSON object. "
+            "Falling back to random search."
+        )
+        return None
+
+    return loaded
+
+
+def run_xgb_randomized_search(
+    X: np.ndarray,
+    y: np.ndarray,
+    n_splits: int,
+    n_iter: int,
+    random_state: int,
+) -> tuple[dict, XGBRegressor, RandomizedSearchCV]:
+    """Return merged best params dict, refit best_estimator_, and fitted search object."""
+    folds = min(n_splits, X.shape[0])
+    if folds < 2:
+        raise ValueError("RandomizedSearchCV requires at least 2 CV folds.")
+    kfold = KFold(n_splits=folds, shuffle=True, random_state=random_state)
+    base_est = XGBRegressor(**XGB_BASE_PARAMS)
+    search = RandomizedSearchCV(
+        estimator=base_est,
+        param_distributions=XGB_PARAM_DISTRIBUTIONS,
+        n_iter=n_iter,
+        scoring="neg_root_mean_squared_error",
+        cv=kfold,
+        n_jobs=-1,
+        random_state=random_state,
+        refit=True,
+        error_score="raise",
+    )
+    search.fit(X, y)
+    merged = {**XGB_BASE_PARAMS, **search.best_params_}
+    merged = {k: float(v) if isinstance(v, (np.floating, np.integer)) else v for k, v in merged.items()}
+    return merged, search.best_estimator_, search
 
 
 def model_importance(model: XGBRegressor) -> np.ndarray:
@@ -193,6 +208,11 @@ def train_parameter_models(
     metadata: pd.DataFrame,
     n_components: int,
     n_splits: int = 5,
+    best_params_by_param: Optional[dict] = None,
+    *,
+    use_random_search: bool = False,
+    n_random_iter: int = 50,
+    random_search_random_state: int = 42,
 ) -> tuple[dict, dict]:
     n_components = min(n_components, alpha.shape[1])
     param_cols = ["stretch", "n_cyl", "radius", "length"]
@@ -203,7 +223,9 @@ def train_parameter_models(
     for param in param_cols:
         if param not in metadata.columns:
             continue
-        if param not in XGB_BEST_PARAMS_BY_PARAM:
+        if not use_random_search and (
+            best_params_by_param is None or param not in best_params_by_param
+        ):
             print(f"Skipping {param}: no fixed hyperparameters defined")
             continue
 
@@ -221,15 +243,41 @@ def train_parameter_models(
             print(f"Skipping {param}: not enough samples for CV")
             continue
 
-        best_params = {**XGB_BASE_PARAMS, **XGB_BEST_PARAMS_BY_PARAM[param]}
-        best_params_serializable = {
-            k: float(v) if isinstance(v, (np.floating, np.integer)) else v
-            for k, v in best_params.items()
-        }
+        search_obj: Optional[RandomizedSearchCV] = None
+        if use_random_search:
+            print(
+                f"  {param}: RandomizedSearchCV (n_iter={n_random_iter}, "
+                f"{folds}-fold, neg_RMSE)..."
+            )
+            best_params, best_model, search_obj = run_xgb_randomized_search(
+                X,
+                y_clean,
+                n_splits=n_splits,
+                n_iter=n_random_iter,
+                random_state=random_search_random_state,
+            )
+            best_neg_rmse = float(search_obj.best_score_)
+            print(
+                f"  {param}: best CV mean neg_RMSE = {best_neg_rmse:.6g} "
+                f"(RMSE ≈ {-best_neg_rmse:.6g})"
+            )
+        else:
+            best_params = {**XGB_BASE_PARAMS, **best_params_by_param[param]}
+            best_model = XGBRegressor(**best_params)
+            best_model.fit(X, y_clean)
+            best_neg_rmse = None
 
-        # Train final model on full data (saved for run_predict.py)
-        best_model = XGBRegressor(**best_params)
-        best_model.fit(X, y_clean)
+        best_params_serializable = _params_to_serializable(best_params)
+
+        # Bootstrap ensemble for input-dependent uncertainty estimation
+        N_BOOTSTRAP = 100
+        ensemble = []
+        for b in range(N_BOOTSTRAP):
+            X_boot, y_boot = resample(X, y_clean, random_state=b)
+            m = XGBRegressor(**best_params)
+            m.fit(X_boot, y_boot)
+            ensemble.append(m)
+        print(f"  {param}: trained {N_BOOTSTRAP}-model bootstrap ensemble")
 
         # Compute CV metrics for reporting
         kfold = KFold(n_splits=folds, shuffle=True, random_state=42)
@@ -244,25 +292,32 @@ def train_parameter_models(
             r2_scores.append(r2_score(y_test, y_pred))
             rmse_scores.append(np.sqrt(mean_squared_error(y_test, y_pred)))
 
-        cv_summary[param] = {
+        cv_entry = {
             "r2_mean": float(np.mean(r2_scores)),
             "r2_std": float(np.std(r2_scores, ddof=1)) if len(r2_scores) > 1 else 0.0,
             "rmse_mean": float(np.mean(rmse_scores)),
             "rmse_std": float(np.std(rmse_scores, ddof=1)) if len(rmse_scores) > 1 else 0.0,
             "n_splits": folds,
             "params": best_params_serializable,
+            "random_search": use_random_search,
         }
+        if use_random_search and search_obj is not None:
+            cv_entry["random_search_n_iter"] = n_random_iter
+            cv_entry["random_search_best_neg_rmse"] = float(search_obj.best_score_)
+        cv_summary[param] = cv_entry
 
         models[param] = {
             "model_type": "XGBoost",
             "r2_score": cv_summary[param]["r2_mean"],
             "model": best_model,
+            "ensemble": ensemble,
             "params": best_params,
         }
 
+        mean_imp = np.mean([model_importance(m) for m in ensemble], axis=0)
         importance_results[param] = {
             "r2_score": cv_summary[param]["r2_mean"],
-            "importance": model_importance(best_model),
+            "importance": mean_imp,
             "model_type": "XGBoost",
             "params": best_params,
         }
@@ -358,7 +413,21 @@ def main() -> None:
         default=5,
         help="Number of CV splits for reporting (default: 5)",
     )
+    parser.add_argument(
+        "--random-search",
+        action="store_true",
+        help="Force RandomizedSearchCV per parameter (otherwise load xgboost_best_params.json from --models-dir).",
+    )
+    parser.add_argument(
+        "--random-search-iter",
+        type=int,
+        default=50,
+        dest="random_search_iter",
+        help="RandomizedSearchCV trials per parameter (default: 50).",
+    )
     args = parser.parse_args()
+    if args.random_search_iter < 1:
+        raise ValueError("--random-search-iter must be >= 1.")
 
     pca_results_dir = Path(args.pca_dir)
     models_dir = Path(args.models_dir) if args.models_dir else pca_results_dir / "models"
@@ -367,18 +436,44 @@ def main() -> None:
     alpha, metadata = load_reduced_order_model(pca_results_dir, args.model_components)
     n_components = alpha.shape[1]
 
-    if metadata is None or metadata.empty:
+    if metadata.empty:
         raise ValueError("No metadata available; cannot train parameter models.")
 
     metadata = metadata.reset_index(drop=True)
+
+    loaded_best_params = load_best_params_from_json(models_dir)
+    use_random_search = args.random_search
+    if not use_random_search and loaded_best_params is None:
+        print(
+            f"Error: {models_dir / 'xgboost_best_params.json'} not found. "
+            "Performing random search instead."
+        )
+        use_random_search = True
 
     model_bundle, importance_results = train_parameter_models(
         alpha,
         metadata,
         n_components=n_components,
         n_splits=args.n_splits,
+        best_params_by_param=loaded_best_params,
+        use_random_search=use_random_search,
+        n_random_iter=args.random_search_iter,
     )
     print_cv_summary(model_bundle.get("cv_summary", {}))
+
+    cv_summary = model_bundle.get("cv_summary", {})
+    best_params_path = models_dir / "xgboost_best_params.json"
+    with open(best_params_path, "w") as f:
+        json.dump(
+            {p: cv_summary[p]["params"] for p in cv_summary},
+            f,
+            indent=2,
+        )
+    if use_random_search:
+        print(
+            f"Saved hyperparameters to {best_params_path} "
+            "for future runs."
+        )
 
     models_path = models_dir / "parameter_models.pkl"
     with open(models_path, "wb") as f:

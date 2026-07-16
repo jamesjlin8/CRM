@@ -1,0 +1,13 @@
+# Ignore everything by default
+*
+
+# Track root-level Python and Slurm scripts only
+!/*.py
+!/*.s
+
+# Exclude specific scripts
+populate_predictions_sheet.py
+run_predict_from_coefficients.py
+
+# Keep this file in version control
+!.gitignore

@@ -466,23 +466,41 @@ def plot_pca_modes_1d(U: np.ndarray,
 
     x_axis = q_values if q_values is not None else np.arange(U.shape[0])
     x_label = r'$q$ [Å⁻¹]' if q_values is not None else 'Q-point Index'
-    
-    # Common y-limits across modes for easier comparison
-    all_vals = U[:, :n_modes].ravel()
-    y_min = np.percentile(all_vals, 1)
-    y_max = np.percentile(all_vals, 99)
+    use_loglog = q_values is not None and np.all(np.asarray(q_values) > 0)
     
     for i in range(n_modes):
         ax = axes[i]
         mode = U[:, i]
         
-        ax.plot(x_axis, mode, 'b-', linewidth=1.0)
-        ax.axhline(0.0, color='k', linewidth=0.8, alpha=0.5)
+        if use_loglog:
+            pos_mask = (
+                np.isfinite(x_axis) & np.isfinite(mode)
+                & (x_axis > 0) & (mode > 0)
+            )
+            neg_mask = (
+                np.isfinite(x_axis) & np.isfinite(mode)
+                & (x_axis > 0) & (mode < 0)
+            )
+            if np.any(pos_mask):
+                ax.loglog(
+                    x_axis[pos_mask], mode[pos_mask],
+                    'b-', linewidth=1.0, label='mode > 0',
+                )
+            if np.any(neg_mask):
+                ax.loglog(
+                    x_axis[neg_mask], -mode[neg_mask],
+                    'r-', linewidth=1.0, label='mode < 0',
+                )
+            if np.any(pos_mask) and np.any(neg_mask):
+                ax.legend(fontsize=7, loc='best')
+        else:
+            ax.plot(x_axis, mode, 'b-', linewidth=1.0)
+            ax.axhline(0.0, color='k', linewidth=0.8, alpha=0.5)
+        
         ax.set_title(f'Mode {i+1}', fontsize=11, fontweight='bold')
         ax.set_xlabel(x_label, fontsize=10)
-        ax.set_ylabel('Mode Amplitude', fontsize=10)
-        ax.grid(True, alpha=0.3)
-        ax.set_ylim(y_min, y_max)
+        ax.set_ylabel(r'$|I(q)|$ mode' if use_loglog else 'Mode Amplitude', fontsize=10)
+        ax.grid(True, alpha=0.3, which='both')
     
     # Hide unused axes
     for i in range(n_modes, len(axes)):

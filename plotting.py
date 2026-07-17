@@ -2,12 +2,13 @@
 """
 Plot FlowCalc-generated scattering pattern data files.
 Usage: python plotting.py <data_file> [data_file ...] [--sigma SIGMA] [--beta BETA]
-       [--subtract FILE2] [--save] [--ivq]
+       [--background BG] [--q-min QMIN] [--q-max QMAX] [--subtract FILE2] [--save] [--ivq]
 
 Multiple files with --ivq overlay all I(q) curves (averaged and raw panels).
 python plotting.py file --subtract file2  →  plot (file minus file2).
 
 Model parameters (St, cyl, r, l) are extracted from each filename.
+Use --q-min/--q-max to restrict I(q) overlays to a reliable experimental window.
 """
 
 import argparse
@@ -21,6 +22,23 @@ DEFAULT_SCALVOLFRAC = 8.577
 DEFAULT_BACKGROUND = 0.0
 SMEAR_N_SIGMA = 3.0
 SMEAR_MIN_SIGMA = 1e-12
+DEFAULT_SAVE_FORMAT = 'png'
+DEFAULT_SAVE_DPI = 300
+
+
+def _save_figure(fig, output_path, dpi=None):
+    """Save a figure as PNG (format inferred from suffix, default png)."""
+    output_path = Path(output_path)
+    if output_path.suffix.lower() == '.pdf':
+        output_path = output_path.with_suffix('.png')
+    fmt = output_path.suffix.lstrip('.').lower() or DEFAULT_SAVE_FORMAT
+    fig.savefig(
+        output_path,
+        dpi=dpi or DEFAULT_SAVE_DPI,
+        format=fmt,
+        bbox_inches='tight',
+    )
+    print(f"Saved: {output_path}")
 
 RHEO_STITCHED_RE = re.compile(
     r"^(?P<conc>\d+mM)_(?P<shear>\d+)s1_all\.dat$", re.IGNORECASE
@@ -337,10 +355,7 @@ def plot_scattering_pattern(qx, qy, intensity, params, title="", use_log=True,
     plt.tight_layout()
     
     if output_path is not None:
-        output_path = Path(output_path)
-        fig.savefig(output_path, dpi=params.get('save_dpi', 300), 
-                    format='pdf', bbox_inches='tight')
-        print(f"Saved: {output_path}")
+        _save_figure(fig, output_path, dpi=params.get('save_dpi', DEFAULT_SAVE_DPI))
     
     return fig
 
@@ -459,9 +474,23 @@ def _create_ivq_axes(params=None, title_suffix=""):
     return fig, ax_avg, ax_raw
 
 
-def _plot_ivq_series(ax_avg, ax_raw, q, intensity, label, params=None):
+def _apply_q_range(q, intensity, q_min=None, q_max=None):
+    """Keep points inside an optional |q| window."""
+    q = np.asarray(q, dtype=float)
+    intensity = np.asarray(intensity, dtype=float)
+    mask = np.ones(q.shape, dtype=bool)
+    if q_min is not None:
+        mask &= q >= float(q_min)
+    if q_max is not None:
+        mask &= q <= float(q_max)
+    return q[mask], intensity[mask]
+
+
+def _plot_ivq_series(ax_avg, ax_raw, q, intensity, label, params=None,
+                     q_min=None, q_max=None):
     """Plot azimuthally averaged curve and raw scatter for one intensity series."""
-    q_pos, intensity_pos = _mask_positive_log(q, intensity)
+    q_win, intensity_win = _apply_q_range(q, intensity, q_min=q_min, q_max=q_max)
+    q_pos, intensity_pos = _mask_positive_log(q_win, intensity_win)
     if q_pos.size == 0:
         print(f"Warning: No positive intensities to plot for {label or 'series'}.")
         return
@@ -481,7 +510,7 @@ def _plot_ivq_series(ax_avg, ax_raw, q, intensity, label, params=None):
     )
 
 
-def _finalize_ivq_axes(ax_avg, ax_raw, params=None):
+def _finalize_ivq_axes(ax_avg, ax_raw, params=None, q_min=None, q_max=None):
     """Apply log scales, legend, and layout to I(q) subplots."""
     p = params or {}
     fontsize = p.get('fontsize', 12)
@@ -489,11 +518,15 @@ def _finalize_ivq_axes(ax_avg, ax_raw, params=None):
         ax.set_xscale('log')
         ax.set_yscale('log')
         ax.tick_params(labelsize=fontsize)
+        if q_min is not None or q_max is not None:
+            left = float(q_min) if q_min is not None else None
+            right = float(q_max) if q_max is not None else None
+            ax.set_xlim(left, right)
     _format_ivq_legend(ax_avg, params)
 
 
 def plot_I_vs_q(q, inosq, iwithsq=None, params=None, title_suffix="", output_path=None,
-                label=None, ax_avg=None, ax_raw=None):
+                label=None, ax_avg=None, ax_raw=None, q_min=None, q_max=None):
     """Plot azimuthally averaged I(q) and raw (non-averaged) intensities vs q."""
     own_fig = ax_avg is None
     if own_fig:
@@ -501,25 +534,27 @@ def plot_I_vs_q(q, inosq, iwithsq=None, params=None, title_suffix="", output_pat
     else:
         fig = ax_avg.figure
 
-    _plot_ivq_series(ax_avg, ax_raw, q, inosq, label, params)
+    _plot_ivq_series(ax_avg, ax_raw, q, inosq, label, params, q_min=q_min, q_max=q_max)
     if iwithsq is not None:
         withsq_label = f"{label} with S(q)" if label else "I(q) with S(q)"
-        _plot_ivq_series(ax_avg, ax_raw, q, iwithsq, withsq_label, params)
+        _plot_ivq_series(
+            ax_avg, ax_raw, q, iwithsq, withsq_label, params,
+            q_min=q_min, q_max=q_max,
+        )
 
     if own_fig:
-        _finalize_ivq_axes(ax_avg, ax_raw, params)
+        _finalize_ivq_axes(ax_avg, ax_raw, params, q_min=q_min, q_max=q_max)
         plt.tight_layout()
 
         if output_path is not None:
-            output_path = Path(output_path)
-            fig.savefig(output_path, dpi=(params.get('save_dpi', 300) if params else 300),
-                        format='pdf', bbox_inches='tight')
-            print(f"Saved: {output_path}")
+            dpi = params.get('save_dpi', DEFAULT_SAVE_DPI) if params else DEFAULT_SAVE_DPI
+            _save_figure(fig, output_path, dpi=dpi)
 
     return fig
 
 
-def plot_I_vs_q_overlay(datasets, params=None, use_with_sq=False, title="", output_path=None):
+def plot_I_vs_q_overlay(datasets, params=None, use_with_sq=False, title="", output_path=None,
+                        q_min=None, q_max=None):
     """Plot multiple I(q) curves on shared average and raw subplots.
 
     Parameters
@@ -539,6 +574,7 @@ def plot_I_vs_q_overlay(datasets, params=None, use_with_sq=False, title="", outp
             ax_avg, ax_raw,
             entry['q'], entry['inosq'],
             entry['label'], params,
+            q_min=q_min, q_max=q_max,
         )
         if use_with_sq:
             withsq_label = f"{entry['label']} with S(q)"
@@ -546,21 +582,20 @@ def plot_I_vs_q_overlay(datasets, params=None, use_with_sq=False, title="", outp
                 ax_avg, ax_raw,
                 entry['q'], entry['iwithsq'],
                 withsq_label, params,
+                q_min=q_min, q_max=q_max,
             )
 
-    _finalize_ivq_axes(ax_avg, ax_raw, params)
+    _finalize_ivq_axes(ax_avg, ax_raw, params, q_min=q_min, q_max=q_max)
     plt.tight_layout()
 
     if output_path is not None:
-        output_path = Path(output_path)
-        fig.savefig(output_path, dpi=(params.get('save_dpi', 300) if params else 300),
-                    format='pdf', bbox_inches='tight')
-        print(f"Saved: {output_path}")
+        dpi = params.get('save_dpi', DEFAULT_SAVE_DPI) if params else DEFAULT_SAVE_DPI
+        _save_figure(fig, output_path, dpi=dpi)
 
     return fig
 
 
-def _load_processed_data(data_file, sigma=0.0, beta=0.0):
+def _load_processed_data(data_file, sigma=0.0, beta=0.0, background=None):
     """Load a data file and return processed scattering arrays."""
     data_file = Path(data_file)
 
@@ -590,6 +625,8 @@ def _load_processed_data(data_file, sigma=0.0, beta=0.0):
 
     stretch_val = file_params['stretch'] if file_params['stretch'] is not None else 0.0
     params = _build_params(file_params, beta)
+    if background is not None:
+        params['background'] = float(background)
 
     print(f"Loading data from: {data_file}")
     if rheo_meta is not None:
@@ -600,6 +637,7 @@ def _load_processed_data(data_file, sigma=0.0, beta=0.0):
     else:
         print(f"  Stretch: {stretch_val}")
         print(f"  n_cyl: {params['n_cyl']}, radius: {params['radius']}, length: {params['length']}")
+        print(f"  background: {params['background']}")
     if sigma > 0:
         print(f"  Smearing sigma: {sigma}")
     if beta > 0:
@@ -652,13 +690,15 @@ def _load_processed_data(data_file, sigma=0.0, beta=0.0):
     }
 
 
-def _load_subtrahend(subtract, sigma, beta):
+def _load_subtrahend(subtract, sigma, beta, background=None):
     """Load the file passed to --subtract."""
-    subtrahend = _load_processed_data(subtract, sigma=sigma, beta=beta)
+    subtrahend = _load_processed_data(
+        subtract, sigma=sigma, beta=beta, background=background,
+    )
     return subtrahend
 
 
-def _apply_subtract(minuend, subtract, sigma, beta):
+def _apply_subtract(minuend, subtract, sigma, beta, background=None):
     """Subtract --subtract file from the primary (first) file."""
     minuend_path = minuend['data_file'].resolve()
     subtrahend_path = Path(subtract).resolve()
@@ -667,7 +707,7 @@ def _apply_subtract(minuend, subtract, sigma, beta):
         print("Error: --subtract file must differ from the data file.")
         sys.exit(1)
 
-    subtrahend = _load_subtrahend(subtract, sigma, beta)
+    subtrahend = _load_subtrahend(subtract, sigma, beta, background=background)
     _subtract_from(minuend, subtrahend)
     print(
         f"Subtracted {subtrahend['data_file'].name} "
@@ -675,7 +715,8 @@ def _apply_subtract(minuend, subtract, sigma, beta):
     )
 
 
-def plot_from_loaded(loaded, save=False, plot_ivq=False, use_with_sq=False, show=True):
+def plot_from_loaded(loaded, save=False, plot_ivq=False, use_with_sq=False, show=True,
+                     q_min=None, q_max=None):
     """Plot pre-loaded scattering data."""
     data_file = loaded['data_file']
     qx, qy = loaded['qx'], loaded['qy']
@@ -695,7 +736,7 @@ def plot_from_loaded(loaded, save=False, plot_ivq=False, use_with_sq=False, show
         beta_str = '0'
     
     # Plot inosq
-    inosq_path = output_dir / f'Phi0_St{stretch_str}_{n_cyl_str}cyl_{radius_str}r_{length_str}l_InoSq.pdf' if save else None
+    inosq_path = output_dir / f'Phi0_St{stretch_str}_{n_cyl_str}cyl_{radius_str}r_{length_str}l_InoSq.png' if save else None
     plot_scattering_pattern(
         qx, qy, inosq, params,
         title=f"Scattering Pattern (No Structure Factor)\nStretch = {stretch_val}",
@@ -704,7 +745,7 @@ def plot_from_loaded(loaded, save=False, plot_ivq=False, use_with_sq=False, show
     
     # Plot iwithsq if structure factor is enabled
     if use_with_sq:
-        iwithsq_path = output_dir / f'Phi0_St{stretch_str}_{n_cyl_str}cyl_{radius_str}r_{length_str}l_{beta_str}B_IwithSq.pdf' if save else None
+        iwithsq_path = output_dir / f'Phi0_St{stretch_str}_{n_cyl_str}cyl_{radius_str}r_{length_str}l_{beta_str}B_IwithSq.png' if save else None
         plot_scattering_pattern(
             qx, qy, iwithsq, params,
             title=f"Scattering Pattern (With Structure Factor)\nStretch = {stretch_val}",
@@ -716,13 +757,15 @@ def plot_from_loaded(loaded, save=False, plot_ivq=False, use_with_sq=False, show
         ivq_suffix = f"(Stretch = {stretch_val})"
         ivq_path = None
         if save:
-            ivq_path = output_dir / f'Phi0_St{stretch_str}_{n_cyl_str}cyl_{radius_str}r_{length_str}l_Iq.pdf'
+            ivq_path = output_dir / f'Phi0_St{stretch_str}_{n_cyl_str}cyl_{radius_str}r_{length_str}l_Iq.png'
         plot_I_vs_q(
             q, inosq, iwithsq if use_with_sq else None,
             params=params,
             title_suffix=ivq_suffix,
             output_path=ivq_path,
             label=loaded['label'],
+            q_min=q_min,
+            q_max=q_max,
         )
     
     if show:
@@ -730,15 +773,19 @@ def plot_from_loaded(loaded, save=False, plot_ivq=False, use_with_sq=False, show
 
 
 def plot_multiple_data_files(data_files, sigma=0.0, beta=0.0, save=False, plot_ivq=False,
-                             subtract=None, output_path=None, title=None):
+                             subtract=None, output_path=None, title=None,
+                             q_min=None, q_max=None, background=None):
     """Plot multiple data files; overlay I(q) when --ivq is set."""
     data_files = [Path(f) for f in data_files]
     use_with_sq = beta > 0
 
-    loadeds = [_load_processed_data(data_file, sigma=sigma, beta=beta) for data_file in data_files]
+    loadeds = [
+        _load_processed_data(data_file, sigma=sigma, beta=beta, background=background)
+        for data_file in data_files
+    ]
 
     if subtract is not None:
-        _apply_subtract(loadeds[0], subtract, sigma, beta)
+        _apply_subtract(loadeds[0], subtract, sigma, beta, background=background)
 
     if plot_ivq:
         datasets = [{
@@ -751,7 +798,7 @@ def plot_multiple_data_files(data_files, sigma=0.0, beta=0.0, save=False, plot_i
 
         ivq_path = None
         if save:
-            ivq_path = Path(output_path) if output_path else datasets[0]['data_file'].parent / 'Iq_overlay.pdf'
+            ivq_path = Path(output_path) if output_path else datasets[0]['data_file'].parent / 'Iq_overlay.png'
 
         plot_I_vs_q_overlay(
             datasets,
@@ -759,6 +806,8 @@ def plot_multiple_data_files(data_files, sigma=0.0, beta=0.0, save=False, plot_i
             use_with_sq=use_with_sq,
             title=title or 'I(q) overlay',
             output_path=ivq_path,
+            q_min=q_min,
+            q_max=q_max,
         )
         if save:
             plt.close('all')
@@ -773,6 +822,8 @@ def plot_multiple_data_files(data_files, sigma=0.0, beta=0.0, save=False, plot_i
             plot_ivq=False,
             use_with_sq=use_with_sq,
             show=(i == len(loadeds) - 1),
+            q_min=q_min,
+            q_max=q_max,
         )
 
 
@@ -799,6 +850,29 @@ def main():
         help="Structure factor parameter (0 = form factor only; >0 also plots I with S(q))",
     )
     parser.add_argument(
+        "--background",
+        type=float,
+        default=None,
+        help=(
+            "Constant background added to simulated intensities "
+            f"(default: {DEFAULT_BACKGROUND}; ignored for Rheo-SANS files)"
+        ),
+    )
+    parser.add_argument(
+        "--q-min",
+        type=float,
+        default=None,
+        dest="q_min",
+        help="Lower |q| cutoff for I(q) plots (default: none)",
+    )
+    parser.add_argument(
+        "--q-max",
+        type=float,
+        default=None,
+        dest="q_max",
+        help="Upper |q| cutoff for I(q) plots (default: none)",
+    )
+    parser.add_argument(
         "--subtract",
         type=str,
         default=None,
@@ -806,14 +880,14 @@ def main():
         help="Subtract FILE from the data file (e.g. plotting.py file --subtract FILE)",
     )
     parser.add_argument("--save", action="store_true",
-                        help="Save figures to PDF at 300 DPI")
+                        help="Save figures to PNG at 300 DPI")
     parser.add_argument("--ivq", action="store_true",
                         help="Plot I(q): azimuthal average (top) and all raw points (bottom)")
     parser.add_argument(
         "--output",
         type=str,
         default=None,
-        help="Output path for --ivq overlay PDF (default: Iq_overlay.pdf next to first file)",
+        help="Output path for --ivq overlay PNG (default: Iq_overlay.png next to first file)",
     )
     parser.add_argument(
         "--title",
@@ -826,14 +900,24 @@ def main():
     use_with_sq = args.beta > 0
 
     if len(args.data_files) == 1:
-        loaded = _load_processed_data(args.data_files[0], sigma=args.sigma, beta=args.beta)
+        loaded = _load_processed_data(
+            args.data_files[0],
+            sigma=args.sigma,
+            beta=args.beta,
+            background=args.background,
+        )
         if args.subtract is not None:
-            _apply_subtract(loaded, args.subtract, args.sigma, args.beta)
+            _apply_subtract(
+                loaded, args.subtract, args.sigma, args.beta,
+                background=args.background,
+            )
         plot_from_loaded(
             loaded,
             save=args.save,
             plot_ivq=args.ivq,
             use_with_sq=use_with_sq,
+            q_min=args.q_min,
+            q_max=args.q_max,
         )
     else:
         if not args.ivq:
@@ -848,6 +932,9 @@ def main():
             subtract=args.subtract,
             output_path=args.output,
             title=args.title,
+            q_min=args.q_min,
+            q_max=args.q_max,
+            background=args.background,
         )
 
 

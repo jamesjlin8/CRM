@@ -20,6 +20,7 @@ Options:
 """
 
 import argparse
+import json
 import warnings
 from pathlib import Path
 
@@ -677,6 +678,8 @@ def main() -> None:
                         help="Ridge regularization strength used in affine rescaling/PCA projection")
     parser.add_argument("--smooth-sigma", type=float, default=1.0, dest="smooth_sigma",
                         help="Optional mask-normalized Gaussian sigma on aligned 2D intensity grid")
+    parser.add_argument("--no-plots", action="store_true", dest="no_plots",
+                        help="Skip figure generation (still saves JSON summary)")
     args = parser.parse_args()
 
     # --- Validate arguments ---
@@ -1012,6 +1015,43 @@ def main() -> None:
 
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_name = format_plot_filename(pattern_path, model_plot_label).replace(
+        "_pca_coefficients.png", "_summary.json"
+    )
+    summary_path = results_dir / summary_name
+    summary_payload = {
+        "pattern_file": str(pattern_path),
+        "pattern_stem": pattern_path.stem,
+        "pca_dir": str(pca_results_dir),
+        "models_dir": str(models_dir),
+        "rescale_scale": float(rescale_scale),
+        "rescale_background": float(args.rescale_background) if args.rescale_background is not None else None,
+        "rescale_background_fit": float(rescale_bg),
+        "beta": float(beta) if beta is not None else None,
+        "q_min": float(beamstop_qmin),
+        "q_max": float(args.q_max) if args.q_max is not None else None,
+        "rotation_angle_deg": rotation_angle_deg,
+        "rmse_relative_error": rmse_relative_error,
+        "pca_coefficients": alpha_xg.reshape(-1).tolist(),
+        "predictions": {
+            p: {
+                "value": float(predictions[p]),
+                "ci_lo": float(mc_stats[p]["ci_lo"]),
+                "ci_hi": float(mc_stats[p]["ci_hi"]),
+                "sigma_total": float(mc_stats[p]["sigma_total"]),
+                "s_pca": float(mc_stats[p]["s_pca"]),
+                "s_model": float(mc_stats[p]["s_model"]),
+            }
+            for p in predictions
+        },
+    }
+    with open(summary_path, "w") as f:
+        json.dump(summary_payload, f, indent=2)
+    print(f"Saved summary to {summary_path}")
+
+    if args.no_plots:
+        return
 
     # ------------------------------------------------------------------
     # Per-q diagnostic figure

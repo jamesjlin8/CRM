@@ -279,15 +279,32 @@ def smear_intensity(qx, qy, intensity, sigma_rel=0.15, n_sigma=3.0, min_sigma=1e
 
 
 def calculate_intensity(qx, qy, p, params):
-    """Calculate intensity with and without structure factor."""
-    pref = params['scalvolfrac'] * np.pi * params['radius']**2 * \
-           params['length'] * params['n_cyl'] * 1e-5
-    
+    """Calculate intensity with and without structure factor.
+
+    Default (display units): ``I = pref * P [ * S(q) ]`` using scalvolfrac.
+
+    With ``predict_units=True`` (matches run_predict / PCA): column 2 is the form
+    factor ``P`` in simulation-library units (no pref). The affine map is
+    ``scale * (I_exp - bg_sub) + bg_fit ≈ P * S(q)``, so to overlay on raw
+    experimental intensity use ``I_sim_plot = P * S(q) / scale + bg_sub``.
+    """
+    scale = float(params.get('scale', 1.0))
+    if scale == 0.0:
+        raise ValueError("scale must be non-zero")
+    p = np.asarray(p, dtype=float)
+    s = 1.0 / (1.0 + params['beta'] * p) if params['beta'] else np.ones_like(p)
+
+    if params.get('predict_units'):
+        signal = p
+    else:
+        pref = params['scalvolfrac'] * np.pi * params['radius']**2 * \
+               params['length'] * params['n_cyl'] * 1e-5
+        signal = pref * p
+
     q = np.sqrt(qx**2 + qy**2)
-    inosq = pref * p + params['background']
-    s = 1.0 / (1.0 + params['beta'] * p)
-    iwithsq = pref * s * p + params['background']
-    
+    inosq = signal / scale + params['background']
+    iwithsq = (signal * s) / scale + params['background']
+
     return inosq, iwithsq, s, q
 
 
@@ -390,13 +407,15 @@ def _radial_average(q, intensity, n_bins=200):
     return q_centers, I_q
 
 
-def _build_params(file_params, beta):
+def _build_params(file_params, beta, scale=1.0, predict_units=False):
     """Assemble calculation and plot parameters for one file."""
     return {
         'n_cyl': file_params['n_cyl'],
         'radius': file_params['radius'],
         'length': file_params['length'],
         'beta': beta,
+        'scale': float(scale),
+        'predict_units': bool(predict_units),
         'background': DEFAULT_BACKGROUND,
         'scalvolfrac': DEFAULT_SCALVOLFRAC,
         'graphingparameter': 4,
@@ -569,19 +588,32 @@ def plot_I_vs_q_overlay(datasets, params=None, use_with_sq=False, title="", outp
     if title:
         fig.suptitle(title, fontsize=(params.get('fontsize', 12) + 2 if params else 14), y=1.02)
 
+    beta_val = float(params.get('beta', 0.0)) if params else 0.0
     for entry in datasets:
-        _plot_ivq_series(
-            ax_avg, ax_raw,
-            entry['q'], entry['inosq'],
-            entry['label'], params,
-            q_min=q_min, q_max=q_max,
-        )
-        if use_with_sq:
-            withsq_label = f"{entry['label']} with S(q)"
+        is_rheo = entry.get('is_rheo', False)
+        if use_with_sq and not is_rheo:
+            sq_label = entry['label']
+            parts = []
+            if beta_val > 0:
+                beta_str = f"{beta_val:g}".rstrip('0').rstrip('.')
+                parts.append(f"RPA β={beta_str}")
+            sim_scale = float(params.get('scale', 1.0)) if params else 1.0
+            if sim_scale != 1.0:
+                scale_str = f"{sim_scale:g}".rstrip('0').rstrip('.')
+                parts.append(f"scale={scale_str}")
+            if parts:
+                sq_label = f"{sq_label} ({', '.join(parts)})"
             _plot_ivq_series(
                 ax_avg, ax_raw,
                 entry['q'], entry['iwithsq'],
-                withsq_label, params,
+                sq_label, params,
+                q_min=q_min, q_max=q_max,
+            )
+        else:
+            _plot_ivq_series(
+                ax_avg, ax_raw,
+                entry['q'], entry['inosq'],
+                entry['label'], params,
                 q_min=q_min, q_max=q_max,
             )
 
@@ -595,7 +627,9 @@ def plot_I_vs_q_overlay(datasets, params=None, use_with_sq=False, title="", outp
     return fig
 
 
-def _load_processed_data(data_file, sigma=0.0, beta=0.0, background=None):
+def _load_processed_data(data_file, sigma=0.0, beta=0.0, background=None,
+                         rheo_background_subtract=None, scale=1.0,
+                         predict_units=False):
     """Load a data file and return processed scattering arrays."""
     data_file = Path(data_file)
 
@@ -624,7 +658,7 @@ def _load_processed_data(data_file, sigma=0.0, beta=0.0, background=None):
             file_params['length'] = file_params['length'] or 100
 
     stretch_val = file_params['stretch'] if file_params['stretch'] is not None else 0.0
-    params = _build_params(file_params, beta)
+    params = _build_params(file_params, beta, scale=scale, predict_units=predict_units)
     if background is not None:
         params['background'] = float(background)
 
@@ -642,6 +676,10 @@ def _load_processed_data(data_file, sigma=0.0, beta=0.0, background=None):
         print(f"  Smearing sigma: {sigma}")
     if beta > 0:
         print(f"  Structure factor beta: {beta}")
+    if scale != 1.0:
+        print(f"  Sim intensity scale (divide signal by): {scale}")
+    if predict_units:
+        print("  Using run_predict/PCA units (form factor P, no scalvolfrac pref)")
 
     data = np.loadtxt(data_file)
     if rheo_meta is not None:
@@ -655,9 +693,14 @@ def _load_processed_data(data_file, sigma=0.0, beta=0.0, background=None):
 
     if rheo_meta is not None:
         q = np.sqrt(qx ** 2 + qy ** 2)
-        inosq = p.astype(float, copy=False)
+        inosq = p.astype(float, copy=True)
+        if rheo_background_subtract is not None:
+            inosq -= float(rheo_background_subtract)
+            print(f"  Subtracted Rheo-SANS background: {float(rheo_background_subtract):g}")
         iwithsq = inosq
         label = _rheo_legend_label(rheo_meta)
+        if rheo_background_subtract is not None:
+            label += f" (bg−{float(rheo_background_subtract):g})"
     else:
         inosq, iwithsq, s, q = calculate_intensity(qx, qy, p, params)
         label = _legend_label(stretch_val, params)
@@ -687,18 +730,23 @@ def _load_processed_data(data_file, sigma=0.0, beta=0.0, background=None):
         'params': params,
         'stretch_val': stretch_val,
         'label': label,
+        'is_rheo': rheo_meta is not None,
     }
 
 
-def _load_subtrahend(subtract, sigma, beta, background=None):
+def _load_subtrahend(subtract, sigma, beta, background=None, rheo_background_subtract=None,
+                     scale=1.0, predict_units=False):
     """Load the file passed to --subtract."""
     subtrahend = _load_processed_data(
         subtract, sigma=sigma, beta=beta, background=background,
+        rheo_background_subtract=rheo_background_subtract, scale=scale,
+        predict_units=predict_units,
     )
     return subtrahend
 
 
-def _apply_subtract(minuend, subtract, sigma, beta, background=None):
+def _apply_subtract(minuend, subtract, sigma, beta, background=None,
+                    rheo_background_subtract=None, scale=1.0, predict_units=False):
     """Subtract --subtract file from the primary (first) file."""
     minuend_path = minuend['data_file'].resolve()
     subtrahend_path = Path(subtract).resolve()
@@ -707,7 +755,11 @@ def _apply_subtract(minuend, subtract, sigma, beta, background=None):
         print("Error: --subtract file must differ from the data file.")
         sys.exit(1)
 
-    subtrahend = _load_subtrahend(subtract, sigma, beta, background=background)
+    subtrahend = _load_subtrahend(
+        subtract, sigma, beta, background=background,
+        rheo_background_subtract=rheo_background_subtract, scale=scale,
+        predict_units=predict_units,
+    )
     _subtract_from(minuend, subtrahend)
     print(
         f"Subtracted {subtrahend['data_file'].name} "
@@ -774,18 +826,28 @@ def plot_from_loaded(loaded, save=False, plot_ivq=False, use_with_sq=False, show
 
 def plot_multiple_data_files(data_files, sigma=0.0, beta=0.0, save=False, plot_ivq=False,
                              subtract=None, output_path=None, title=None,
-                             q_min=None, q_max=None, background=None):
+                             q_min=None, q_max=None, background=None,
+                             rheo_background_subtract=None, scale=1.0,
+                             predict_units=False):
     """Plot multiple data files; overlay I(q) when --ivq is set."""
     data_files = [Path(f) for f in data_files]
     use_with_sq = beta > 0
 
     loadeds = [
-        _load_processed_data(data_file, sigma=sigma, beta=beta, background=background)
+        _load_processed_data(
+            data_file, sigma=sigma, beta=beta, background=background,
+            rheo_background_subtract=rheo_background_subtract, scale=scale,
+            predict_units=predict_units,
+        )
         for data_file in data_files
     ]
 
     if subtract is not None:
-        _apply_subtract(loadeds[0], subtract, sigma, beta, background=background)
+        _apply_subtract(
+            loadeds[0], subtract, sigma, beta, background=background,
+            rheo_background_subtract=rheo_background_subtract, scale=scale,
+            predict_units=predict_units,
+        )
 
     if plot_ivq:
         datasets = [{
@@ -794,6 +856,7 @@ def plot_multiple_data_files(data_files, sigma=0.0, beta=0.0, save=False, plot_i
             'inosq': loaded['inosq'],
             'iwithsq': loaded['iwithsq'],
             'label': loaded['label'],
+            'is_rheo': loaded.get('is_rheo', False),
         } for loaded in loadeds]
 
         ivq_path = None
@@ -859,6 +922,15 @@ def main():
         ),
     )
     parser.add_argument(
+        "--scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Divide simulated signal by this factor before adding background "
+            "(matches run_predict --rescale-scale, where scale multiplies experimental; default: 1.0)"
+        ),
+    )
+    parser.add_argument(
         "--q-min",
         type=float,
         default=None,
@@ -895,6 +967,21 @@ def main():
         default=None,
         help="Figure title for --ivq overlay",
     )
+    parser.add_argument(
+        "--rheo-background-subtract",
+        type=float,
+        default=None,
+        dest="rheo_background_subtract",
+        help="Subtract constant background from Rheo-SANS intensities (default: none)",
+    )
+    parser.add_argument(
+        "--predict-units",
+        action="store_true",
+        help=(
+            "Match run_predict/PCA intensity units: use raw form factor P from .dat "
+            "(no scalvolfrac pref). With --background, sim is plotted as P*S(q)/scale + bg."
+        ),
+    )
     
     args = parser.parse_args()
     use_with_sq = args.beta > 0
@@ -905,11 +992,17 @@ def main():
             sigma=args.sigma,
             beta=args.beta,
             background=args.background,
+            rheo_background_subtract=args.rheo_background_subtract,
+            scale=args.scale,
+            predict_units=args.predict_units,
         )
         if args.subtract is not None:
             _apply_subtract(
                 loaded, args.subtract, args.sigma, args.beta,
                 background=args.background,
+                rheo_background_subtract=args.rheo_background_subtract,
+                scale=args.scale,
+                predict_units=args.predict_units,
             )
         plot_from_loaded(
             loaded,
@@ -935,6 +1028,9 @@ def main():
             q_min=args.q_min,
             q_max=args.q_max,
             background=args.background,
+            rheo_background_subtract=args.rheo_background_subtract,
+            scale=args.scale,
+            predict_units=args.predict_units,
         )
 
 

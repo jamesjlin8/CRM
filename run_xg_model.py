@@ -481,10 +481,6 @@ def main() -> None:
     gb_importance_path = models_dir / "predictive_importance_xgboost.png"
     plot_predictive_importance(importance_results, gb_importance_path)
 
-    importance_pickle = models_dir / "predictive_importance_results.pkl"
-    with open(importance_pickle, "wb") as f:
-        pickle.dump(importance_results, f)
-
     summary_path = models_dir / "cv_summary.json"
     with open(summary_path, "w") as f:
         json.dump(model_bundle.get("cv_summary", {}), f, indent=2)

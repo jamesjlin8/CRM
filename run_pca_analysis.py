@@ -10,7 +10,7 @@ Default:
     python run_pca_analysis.py --input-dir output --output-dir pca/pca12m --n-components 50 --n-modes 10 --q-min 0.004
 
 Usage:
-    python run_pca_analysis.py [--input-dir DIR] [--output-dir DIR] [--n-components N] [--n-modes M] [--load] [--q-min QMIN]
+    python run_pca_analysis.py [--input-dir DIR] [--output-dir DIR] [--n-components N] [--n-modes M] [--q-min QMIN]
     [--length-min L] [--length-max L] [--stretch-min S] [--stretch-max S] [--n-cyl-min N] [--n-cyl-max N] [--radius-min R] [--radius-max R]
     Parameter filters (parsed from filenames) restrict which patterns are included in PCA, e.g. --length-min 300 --length-max 500.
 """
@@ -95,7 +95,7 @@ def load_scattering_patterns(
     n_cyl_max: Optional[int] = None,
     radius_min: Optional[int] = None,
     radius_max: Optional[int] = None,
-) -> Tuple[np.ndarray, list, np.ndarray, np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
+) -> Tuple[np.ndarray, list, np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
     """
     Load scattering patterns from .dat files using the native simulation spatial grid
     from the first valid file as a fixed template.
@@ -110,13 +110,12 @@ def load_scattering_patterns(
         radius_min, radius_max: Include only files with radius in [radius_min, radius_max]
 
     Returns:
-        Tuple of (intensity_matrix, file_names, q_values, qx_ref, qy_ref, phi_ref, metadata)
+        Tuple of (intensity_matrix, file_names, q_values, qx_ref, qy_ref, metadata)
         - intensity_matrix: Array of shape (n_patterns, n_q_points)
         - file_names: List of source file names
         - q_values: |q| at each grid point (from reference grid)
         - qx_ref: qx coordinates from reference (first valid) file
         - qy_ref: qy coordinates from reference file
-        - phi_ref: Polar angle phi = arctan2(qy, qx) from reference file
         - metadata: DataFrame with columns: stretch, n_cyl, radius, length
     """
     data_dir = Path(data_dir)
@@ -222,7 +221,6 @@ def load_scattering_patterns(
 
     intensity_matrix = np.array(patterns)
     q_values_ref = np.sqrt(master_qx**2 + master_qy**2)
-    phi_ref = np.arctan2(master_qy, master_qx)
     metadata_df = pd.DataFrame(metadata_list)
 
     print(
@@ -234,7 +232,6 @@ def load_scattering_patterns(
         q_values_ref,
         master_qx,
         master_qy,
-        phi_ref,
         metadata_df,
     )
 
@@ -446,6 +443,10 @@ def plot_pca_modes_1d(U: np.ndarray,
     """
     Plot the first n_modes PCA modes as 1D intensity vs q (I(q)) in a single
     multi-panel figure, similar to the 2D mode plots.
+
+    When q-values are available, uses log-log axes (positive values only).
+    Positive mode amplitudes are blue dots; negative amplitudes are plotted as
+    |mode| in red so both signs remain visible on the same log scale.
     
     Args:
         U: Principal components, shape (n_q_points, n_components)
@@ -454,6 +455,8 @@ def plot_pca_modes_1d(U: np.ndarray,
         output_path: Path to save the combined plot
     """
     n_modes = min(n_modes, U.shape[1])
+    dot_size = 1
+    dot_alpha = 0.15
     
     # Subplot layout similar to 2D modes
     n_cols = 3
@@ -466,7 +469,7 @@ def plot_pca_modes_1d(U: np.ndarray,
 
     x_axis = q_values if q_values is not None else np.arange(U.shape[0])
     x_label = r'$q$ [Å⁻¹]' if q_values is not None else 'Q-point Index'
-    use_loglog = q_values is not None and np.all(np.asarray(q_values) > 0)
+    use_loglog = q_values is not None
     
     for i in range(n_modes):
         ax = axes[i]
@@ -484,17 +487,22 @@ def plot_pca_modes_1d(U: np.ndarray,
             if np.any(pos_mask):
                 ax.loglog(
                     x_axis[pos_mask], mode[pos_mask],
-                    'b-', linewidth=1.0, label='mode > 0',
+                    'o', color='blue', markersize=dot_size, alpha=dot_alpha,
+                    linestyle='none', label='mode > 0',
                 )
             if np.any(neg_mask):
                 ax.loglog(
-                    x_axis[neg_mask], -mode[neg_mask],
-                    'r-', linewidth=1.0, label='mode < 0',
+                    x_axis[neg_mask], np.abs(mode[neg_mask]),
+                    'o', color='red', markersize=dot_size, alpha=dot_alpha,
+                    linestyle='none', label='mode < 0',
                 )
             if np.any(pos_mask) and np.any(neg_mask):
                 ax.legend(fontsize=7, loc='best')
         else:
-            ax.plot(x_axis, mode, 'b-', linewidth=1.0)
+            ax.scatter(
+                x_axis, mode, c='blue', s=dot_size, alpha=dot_alpha,
+                edgecolors='none',
+            )
             ax.axhline(0.0, color='k', linewidth=0.8, alpha=0.5)
         
         ax.set_title(f'Mode {i+1}', fontsize=11, fontweight='bold')
@@ -510,96 +518,6 @@ def plot_pca_modes_1d(U: np.ndarray,
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
-
-
-def plot_reconstructed_patterns(intensity_matrix: np.ndarray,
-                                U: np.ndarray,
-                                mean_intensity: np.ndarray,
-                                n_patterns: int = 3,
-                                n_modes_list: list = [5, 10, 20, 40],
-                                q_values: Optional[np.ndarray] = None,
-                                pattern_indices: Optional[list] = None,
-                                output_path: Path = None):
-    """
-    Plot original vs reconstructed patterns using different numbers of modes.
-    
-    Args:
-        intensity_matrix: Original intensity patterns
-        U: Principal components
-        mean_intensity: Mean intensity used for centering
-        n_patterns: Number of example patterns to plot (used when pattern_indices is None)
-        n_modes_list: List of number of modes to use for reconstruction
-        q_values: Optional q-values for x-axis
-        pattern_indices: Optional list of row indices to plot; when provided, overrides n_patterns
-        output_path: Path to save the plot
-    """
-    n_max = intensity_matrix.shape[0]
-    if pattern_indices is not None:
-        pattern_indices = [int(i) for i in pattern_indices]
-        pattern_indices = [max(0, min(i, n_max - 1)) for i in pattern_indices]
-        n_patterns = len(pattern_indices)
-    else:
-        n_patterns = min(n_patterns, n_max)
-        pattern_indices = np.linspace(0, n_max - 1, n_patterns, dtype=int)
-    
-    centered_data = intensity_matrix - mean_intensity
-    
-    n_cols = len(n_modes_list) + 1  # +1 for original
-    fig, axes = plt.subplots(n_patterns, n_cols, figsize=(3*n_cols, 3*n_patterns), dpi=300)
-    if n_patterns == 1:
-        axes = axes.reshape(1, -1)
-    
-    x_axis = q_values if q_values is not None else np.arange(intensity_matrix.shape[1])
-    x_label = r'$q$ [Å⁻¹]' if q_values is not None else 'Q-point Index'
-    use_loglog = q_values is not None and np.all(np.asarray(q_values) > 0)
-    
-    for row, pattern_idx in enumerate(pattern_indices):
-        original = intensity_matrix[pattern_idx, :]
-        
-        # Plot original
-        ax = axes[row, 0]
-        if use_loglog:
-            orig_mask = np.isfinite(x_axis) & np.isfinite(original) & (x_axis > 0) & (original > 0)
-            ax.loglog(x_axis[orig_mask], original[orig_mask], 'k-', linewidth=2, label='Original')
-        else:
-            ax.plot(x_axis, original, 'k-', linewidth=2, label='Original')
-        ax.set_title('Original' if row == 0 else '', fontsize=10, fontweight='bold')
-        if row == n_patterns - 1:
-            ax.set_xlabel(x_label, fontsize=9)
-        ax.set_ylabel('Intensity', fontsize=9)
-        ax.grid(True, alpha=0.3)
-        
-        # Plot reconstructions with different numbers of modes
-        for col, n_modes in enumerate(n_modes_list, start=1):
-            n_modes = min(n_modes, U.shape[1])
-            alpha = centered_data[pattern_idx:pattern_idx+1, :] @ U[:, :n_modes]
-            reconstructed = (alpha @ U[:, :n_modes].T + mean_intensity).flatten()
-            
-            ax = axes[row, col]
-            if use_loglog:
-                orig_mask = np.isfinite(x_axis) & np.isfinite(original) & (x_axis > 0) & (original > 0)
-                recon_mask = np.isfinite(x_axis) & np.isfinite(reconstructed) & (x_axis > 0) & (reconstructed > 0)
-                ax.loglog(x_axis[orig_mask], original[orig_mask], 'k--', linewidth=1, alpha=0.5, label='Original')
-                ax.loglog(x_axis[recon_mask], reconstructed[recon_mask], 'r-', linewidth=1.5, label=f'{n_modes} modes')
-            else:
-                ax.plot(x_axis, original, 'k--', linewidth=1, alpha=0.5, label='Original')
-                ax.plot(x_axis, reconstructed, 'r-', linewidth=1.5, label=f'{n_modes} modes')
-            ax.set_title(f'{n_modes} modes' if row == 0 else '', fontsize=10, fontweight='bold')
-            if row == n_patterns - 1:
-                ax.set_xlabel(x_label, fontsize=9)
-            if col == 0:
-                ax.set_ylabel('Intensity', fontsize=9)
-            ax.grid(True, alpha=0.3)
-    
-    plt.suptitle('Original vs Reconstructed Patterns', fontsize=12, fontweight='bold')
-    plt.tight_layout()
-    
-    if output_path:
-        plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    
-    plt.close()
-    
-    return fig
 
 
 def plot_mse_vs_modes(intensity_matrix: np.ndarray,
@@ -647,7 +565,7 @@ def plot_mse_vs_modes(intensity_matrix: np.ndarray,
 
 def plot_correlation_matrix(alpha: np.ndarray, metadata: pd.DataFrame, output_path: Path, n_components: int = 10):
     """
-    Calculate and plot correlation matrix between PCA scores and physical parameters.
+    Calculate and plot Spearman correlation matrix between PCA scores and physical parameters.
     
     Args:
         alpha: PCA scores (n_samples, n_components)
@@ -663,35 +581,23 @@ def plot_correlation_matrix(alpha: np.ndarray, metadata: pd.DataFrame, output_pa
     # Combine with metadata
     combined_df = pd.concat([alpha_df, metadata], axis=1)
     
-    # Calculate both Pearson and Spearman correlations
     param_cols = ['stretch', 'n_cyl', 'radius', 'length']
     pc_cols = [f'PC{i+1}' for i in range(n_components)]
     
-    pearson_corr = combined_df[pc_cols + param_cols].corr(method='pearson').loc[pc_cols, param_cols]
     spearman_corr = combined_df[pc_cols + param_cols].corr(method='spearman').loc[pc_cols, param_cols]
     
-    # Create subplots for both correlation types
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6), dpi=300)
-    
-    # Pearson correlation
-    sns.heatmap(pearson_corr, annot=True, fmt='.3f', cmap='RdBu_r', center=0,
-                vmin=-1, vmax=1, ax=axes[0], cbar_kws={'label': 'Pearson r'})
-    axes[0].set_title('Pearson Correlation', fontsize=14, fontweight='bold')
-    axes[0].set_xlabel('Physical Parameters', fontsize=12)
-    axes[0].set_ylabel('PCA Components', fontsize=12)
-    
-    # Spearman correlation
+    fig, ax = plt.subplots(figsize=(8, 6), dpi=300)
     sns.heatmap(spearman_corr, annot=True, fmt='.3f', cmap='RdBu_r', center=0,
-                vmin=-1, vmax=1, ax=axes[1], cbar_kws={'label': 'Spearman ρ'})
-    axes[1].set_title('Spearman Correlation', fontsize=14, fontweight='bold')
-    axes[1].set_xlabel('Physical Parameters', fontsize=12)
-    axes[1].set_ylabel('PCA Components', fontsize=12)
+                vmin=-1, vmax=1, ax=ax, cbar_kws={'label': 'Spearman ρ'})
+    ax.set_title('Spearman Correlation', fontsize=14, fontweight='bold')
+    ax.set_xlabel('Physical Parameters', fontsize=12)
+    ax.set_ylabel('PCA Components', fontsize=12)
     
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
     
-    return pearson_corr, spearman_corr
+    return spearman_corr
 
 
 def main():
@@ -748,7 +654,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Load scattering patterns (reference grid from first valid .dat; beamstop applied)
-    intensity_matrix, file_names, q_values, qx_ref, qy_ref, phi_ref, metadata = load_scattering_patterns(
+    intensity_matrix, file_names, q_values, qx_ref, qy_ref, metadata = load_scattering_patterns(
         input_dir,
         beamstop_qmin=args.q_min,
         length_min=args.length_min,
@@ -765,20 +671,14 @@ def main():
     U, S, VT, pca_model = perform_pca(intensity_matrix, n_components=args.n_components)
     if q_values is not None:
         pca_model["q_values"] = q_values
-    if phi_ref is not None:
-        pca_model["phi_values"] = phi_ref
     
     # Save PCA components
     pca_file = output_dir / 'pca_components.pkl'
     with open(pca_file, 'wb') as f:
         pickle.dump((U, S, pca_model), f)
-    if q_values is not None:
-        np.save(output_dir / 'q_values.npy', q_values)
     if qx_ref is not None and qy_ref is not None:
         np.save(output_dir / 'qx_ref.npy', qx_ref)
         np.save(output_dir / 'qy_ref.npy', qy_ref)
-    if phi_ref is not None:
-        np.save(output_dir / 'phi_ref.npy', phi_ref)
     
     # Compute PCA scores directly from SVD: alpha = VT[:k].T * S[:k]
     # This avoids re-allocating centered_data (= intensity_matrix - mean).
@@ -815,35 +715,11 @@ def main():
     else:
         print("Warning: q-values not available, skipping 1D mode plots")
     
-    n_modes_list = [min(5, n_modes), min(10, n_modes), min(20, n_modes), n_modes]
-    n_modes_list = sorted(set(n_modes_list))  # Remove duplicates and sort
-    # Select patterns by stretch: lowest, middle, highest
-    recon_pattern_indices = None
-    if metadata is not None and 'stretch' in metadata.columns:
-        valid = np.isfinite(metadata['stretch'])
-        if valid.sum() >= 3:
-            sorted_idx = metadata.loc[valid, 'stretch'].sort_values().index
-            idx_list = sorted_idx.tolist()
-            recon_pattern_indices = [
-                idx_list[0],
-                idx_list[len(idx_list) // 2],
-                idx_list[-1],
-            ]
-    plot_reconstructed_patterns(intensity_matrix, U, mean_intensity,
-                                n_patterns=3, n_modes_list=n_modes_list,
-                                q_values=q_values,
-                                pattern_indices=recon_pattern_indices,
-                                output_path=output_dir / 'reconstructed_patterns.png')
-    
-    mse_values = plot_mse_vs_modes(intensity_matrix, U, 
-                                  max_modes=min(args.n_components, U.shape[1]),
-                                  mean_intensity=mean_intensity,
-                                  S=S,
-                                  output_path=output_dir / 'mse_vs_modes.png')
-    
-    # Save MSE values
-    with open(output_dir / 'mse_values.pkl', 'wb') as f:
-        pickle.dump(mse_values, f)
+    plot_mse_vs_modes(intensity_matrix, U,
+                      max_modes=min(args.n_components, U.shape[1]),
+                      mean_intensity=mean_intensity,
+                      S=S,
+                      output_path=output_dir / 'mse_vs_modes.png')
     
     # Correlation analysis with physical parameters
     if metadata is not None and not metadata.empty:
@@ -859,8 +735,8 @@ def main():
             # Ensure we have enough components
             n_comp_for_corr = min(args.n_modes, alpha_clean.shape[1])
             
-            # Correlation Matrix
-            pearson_corr, spearman_corr = plot_correlation_matrix(
+            # Spearman correlation matrix
+            plot_correlation_matrix(
                 alpha_clean, metadata_clean, 
                 output_dir / 'correlation_matrix.png',
                 n_components=n_comp_for_corr

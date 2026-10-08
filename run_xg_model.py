@@ -357,7 +357,7 @@ def plot_predictive_importance(results: dict, output_path: Path) -> None:
             axes[idx].text(
                 0.5,
                 0.5,
-                f"No XGBoost result\nfor {param}",
+                f"No result\nfor {param}",
                 ha="center",
                 va="center",
                 transform=axes[idx].transAxes,
@@ -372,7 +372,7 @@ def plot_predictive_importance(results: dict, output_path: Path) -> None:
         r2_score = param_results.get("r2_score")
         r2_text = f"{r2_score:.3f}" if r2_score is not None else "n/a"
         axes[idx].set_title(
-            f"{param.capitalize()} (R²={r2_text}, XGBoost)",
+            f"{param.capitalize()} (R²={r2_text})",
             fontsize=12,
             fontweight="bold",
         )

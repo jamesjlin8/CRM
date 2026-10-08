@@ -23,6 +23,7 @@ import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 from scipy.interpolate import griddata
 from sklearn.utils.extmath import randomized_svd
 import seaborn as sns
@@ -364,6 +365,15 @@ def _fill_grid(values: np.ndarray, ix: np.ndarray, iy: np.ndarray,
     return Z
 
 
+def _pca_mode_panel_colorbar(fig, ax, vmin: float, vmax: float) -> None:
+    """Colorbar with the same height as the square mode panel."""
+    cax = make_axes_locatable(ax).append_axes("right", size="5%", pad=0.08)
+    # Use a fixed norm (not the panel mappable) so tick values match plt.colorbar(..., ax=ax).
+    sm = plt.cm.ScalarMappable(cmap='RdBu_r', norm=plt.Normalize(vmin=vmin, vmax=vmax))
+    sm.set_array([])
+    fig.colorbar(sm, cax=cax, label='Amplitude')
+
+
 def plot_pca_modes_2d(U: np.ndarray,
                       qx: np.ndarray,
                       qy: np.ndarray,
@@ -375,9 +385,9 @@ def plot_pca_modes_2d(U: np.ndarray,
     """
     n_modes = min(n_modes, U.shape[1])
 
-    n_cols = 3
+    n_cols = 5
     n_rows = (n_modes + n_cols - 1) // n_cols
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(12, 4*n_rows), dpi=300)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 4 * n_rows), dpi=300)
     if n_modes == 1:
         axes = [axes]
     else:
@@ -405,7 +415,7 @@ def plot_pca_modes_2d(U: np.ndarray,
             )
             ax.set_xlabel(r'$q_x$ [Å⁻¹]', fontsize=10)
             ax.set_ylabel(r'$q_y$ [Å⁻¹]', fontsize=10)
-            plt.colorbar(im, ax=ax, label='Amplitude')
+            _pca_mode_panel_colorbar(fig, ax, vmin, vmax)
         else:
             try:
                 ax.tricontourf(qx, qy, mode, levels=32, cmap='RdBu_r', vmin=vmin, vmax=vmax)
@@ -414,9 +424,7 @@ def plot_pca_modes_2d(U: np.ndarray,
             ax.set_xlabel(r'$q_x$ [Å⁻¹]', fontsize=10)
             ax.set_ylabel(r'$q_y$ [Å⁻¹]', fontsize=10)
             ax.set_aspect('equal')
-            sm = plt.cm.ScalarMappable(cmap='RdBu_r', norm=plt.Normalize(vmin=vmin, vmax=vmax))
-            sm.set_array([])
-            plt.colorbar(sm, ax=ax, label='Amplitude')
+            _pca_mode_panel_colorbar(fig, ax, vmin, vmax)
 
         ax.set_title(f'Mode {i+1}', fontsize=11, fontweight='bold')
         ax.grid(True, alpha=0.3)
@@ -459,9 +467,9 @@ def plot_pca_modes_1d(U: np.ndarray,
     dot_alpha = 0.15
     
     # Subplot layout similar to 2D modes
-    n_cols = 3
+    n_cols = 5
     n_rows = (n_modes + n_cols - 1) // n_cols
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(12, 4 * n_rows), dpi=300)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 4 * n_rows), dpi=300)
     if n_modes == 1:
         axes = [axes]
     else:
@@ -488,16 +496,14 @@ def plot_pca_modes_1d(U: np.ndarray,
                 ax.loglog(
                     x_axis[pos_mask], mode[pos_mask],
                     'o', color='blue', markersize=dot_size, alpha=dot_alpha,
-                    linestyle='none', label='mode > 0',
+                    linestyle='none',
                 )
             if np.any(neg_mask):
                 ax.loglog(
                     x_axis[neg_mask], np.abs(mode[neg_mask]),
                     'o', color='red', markersize=dot_size, alpha=dot_alpha,
-                    linestyle='none', label='mode < 0',
+                    linestyle='none',
                 )
-            if np.any(pos_mask) and np.any(neg_mask):
-                ax.legend(fontsize=7, loc='best')
         else:
             ax.scatter(
                 x_axis, mode, c='blue', s=dot_size, alpha=dot_alpha,
@@ -508,7 +514,6 @@ def plot_pca_modes_1d(U: np.ndarray,
         ax.set_title(f'Mode {i+1}', fontsize=11, fontweight='bold')
         ax.set_xlabel(x_label, fontsize=10)
         ax.set_ylabel(r'$|I(q)|$ mode' if use_loglog else 'Mode Amplitude', fontsize=10)
-        ax.grid(True, alpha=0.3, which='both')
     
     # Hide unused axes
     for i in range(n_modes, len(axes)):
@@ -520,23 +525,41 @@ def plot_pca_modes_1d(U: np.ndarray,
     plt.close()
 
 
-def plot_mse_vs_modes(intensity_matrix: np.ndarray,
-                      U: np.ndarray,
+def plot_mse_vs_modes(U: np.ndarray,
                       max_modes: int,
                       mean_intensity: np.ndarray,
                       S: np.ndarray,
-                      output_path: Path):
+                      output_path: Path,
+                      *,
+                      intensity_matrix: Optional[np.ndarray] = None,
+                      n_samples: Optional[int] = None,
+                      explained_variance_ratio: Optional[np.ndarray] = None):
     """Plot reconstruction MSE vs number of PCA modes.
 
     Uses the SVD identity: ||residual(k)||^2 = ||centered||^2 - sum(S[:k]^2),
     so no per-mode matrix reconstruction is needed.
-    """
-    n_samples, n_features = intensity_matrix.shape
-    max_modes = min(max_modes, len(S), U.shape[1])
 
-    total_sq = (np.einsum('ij,ij->', intensity_matrix, intensity_matrix)
-                - n_samples * np.dot(mean_intensity, mean_intensity))
-    mean_val = np.mean(intensity_matrix)
+    Pass ``intensity_matrix`` when it is available. Otherwise supply
+    ``n_samples`` and ``explained_variance_ratio`` from a saved PCA fit.
+    """
+    max_modes = min(max_modes, len(S), U.shape[1])
+    n_features = mean_intensity.shape[0]
+
+    if intensity_matrix is not None:
+        n_samples = intensity_matrix.shape[0]
+        total_sq = (np.einsum('ij,ij->', intensity_matrix, intensity_matrix)
+                    - n_samples * np.dot(mean_intensity, mean_intensity))
+        mean_val = np.mean(intensity_matrix)
+    else:
+        if n_samples is None or explained_variance_ratio is None:
+            raise ValueError(
+                "Provide intensity_matrix or both n_samples and explained_variance_ratio"
+            )
+        ratio0 = float(explained_variance_ratio[0])
+        if ratio0 <= 0:
+            raise ValueError("explained_variance_ratio[0] must be positive")
+        total_sq = float(S[0] ** 2 / ratio0)
+        mean_val = float(np.mean(mean_intensity))
 
     cumulative_s2 = np.cumsum(S[:max_modes] ** 2)
     residual_sq = np.maximum(total_sq - cumulative_s2, 0.0)
@@ -555,7 +578,6 @@ def plot_mse_vs_modes(intensity_matrix: np.ndarray,
     ax.set_xlabel('Number of PCA Modes', fontsize=12)
     ax.set_ylabel('Normalized Reconstruction Error', fontsize=12)
     ax.set_title('Reconstruction Error vs PCA Modes', fontsize=14)
-    ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
@@ -715,11 +737,14 @@ def main():
     else:
         print("Warning: q-values not available, skipping 1D mode plots")
     
-    plot_mse_vs_modes(intensity_matrix, U,
-                      max_modes=min(args.n_components, U.shape[1]),
-                      mean_intensity=mean_intensity,
-                      S=S,
-                      output_path=output_dir / 'mse_vs_modes.png')
+    plot_mse_vs_modes(
+        U,
+        max_modes=min(args.n_components, U.shape[1]),
+        mean_intensity=mean_intensity,
+        S=S,
+        output_path=output_dir / 'mse_vs_modes.png',
+        intensity_matrix=intensity_matrix,
+    )
     
     # Correlation analysis with physical parameters
     if metadata is not None and not metadata.empty:
